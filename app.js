@@ -97,20 +97,27 @@ function parseFighters(txt) {
   let deckMode = null;
   let deckTextLines = [];
   let deckNameLines = [];
+  let planLines = [];
+  let inSpecial = false;
 
   function commit() {
     if (!cur) return;
     const deck = deckTextLines.map((t) => t.trim()).filter(Boolean);
     const names = deckNameLines.map((t) => t.trim()).filter(Boolean);
+    const plans = planLines.map((t) => t.trim()).filter(Boolean);
     cur.deckTextByNo = new Map(deck.map((t, idx) => [idx + 1, t]));
     cur.deckNameByNo = new Map(names.map((t, idx) => [idx + 1, t]));
     cur.deckSize = deck.length;
+    cur.planTextByNo = new Map(plans.map((t, idx) => [idx + 1, t]));
+    cur.planSize = plans.length;
     fighters.push(cur);
     cur = null;
     inDeck = false;
     deckMode = null;
     deckTextLines = [];
     deckNameLines = [];
+    planLines = [];
+    inSpecial = false;
   }
 
   for (const raw of lines) {
@@ -132,6 +139,8 @@ function parseFighters(txt) {
         deckTextByNo: new Map(),
         deckNameByNo: new Map(),
         deckSize: 0,
+        planTextByNo: new Map(),
+        planSize: 0,
       };
       continue;
     }
@@ -139,10 +148,17 @@ function parseFighters(txt) {
 
     if (line.startsWith("Deck No.")) {
       deckMode = "text";
+      inSpecial = false;
       continue;
     }
     if (line.startsWith("DeckName No.")) {
       deckMode = "name";
+      inSpecial = false;
+      continue;
+    }
+    if (line.startsWith("Plan No.")) {
+      deckMode = "plan";
+      inSpecial = false;
       continue;
     }
 
@@ -151,14 +167,27 @@ function parseFighters(txt) {
       const rest = line.slice(1).trim();
       if (rest) {
         if (deckMode === "name") deckNameLines.push(rest);
+        else if (deckMode === "plan") planLines.push(rest);
         else deckTextLines.push(rest);
       }
+      continue;
+    }
+    if (inDeck && line.includes("}")) {
+      const idx = line.indexOf("}");
+      const inside = line.slice(0, idx).trim();
+      if (inside) {
+        if (deckMode === "name") deckNameLines.push(inside);
+        else if (deckMode === "plan") planLines.push(inside);
+        else deckTextLines.push(inside);
+      }
+      inDeck = false;
       continue;
     }
     if (line.endsWith("}")) {
       const inside = line.slice(0, -1).trim();
       if (inside) {
         if (deckMode === "name") deckNameLines.push(inside);
+        else if (deckMode === "plan") planLines.push(inside);
         else deckTextLines.push(inside);
       }
       inDeck = false;
@@ -166,6 +195,7 @@ function parseFighters(txt) {
     }
     if (inDeck) {
       if (deckMode === "name") deckNameLines.push(line);
+      else if (deckMode === "plan") planLines.push(line);
       else deckTextLines.push(line);
       continue;
     }
@@ -199,9 +229,20 @@ function parseFighters(txt) {
         cur.koLine = Number(raw);
       }
     }
-    if (line.startsWith("HP规则：")) cur.hpRules = parseHpRules(line.slice("HP规则：".length).trim());
-    if (line.startsWith("Special system:"))
+    if (line.startsWith("HP规则：")) {
+      inSpecial = false;
+      cur.hpRules = parseHpRules(line.slice("HP规则：".length).trim());
+      continue;
+    }
+    if (line.startsWith("Special system:")) {
       cur.special = line.slice("Special system:".length).trim();
+      inSpecial = true;
+      continue;
+    }
+    if (inSpecial) {
+      cur.special = cur.special ? `${cur.special}\n${line}` : line;
+      continue;
+    }
   }
 
   commit();
@@ -231,8 +272,12 @@ function hasUnknownEffect(effects) {
   const walk = (e) => {
     if (!e) return false;
     if (e.type === "unknown") return true;
-    if (e.type === "linked" || e.type === "conditional" || e.type === "block" || e.type === "onInsert") {
+    if (e.type === "linked" || e.type === "conditional" || e.type === "block" || e.type === "onInsert" || e.type === "afterAll") {
       for (const x of e.inner ?? []) if (walk(x)) return true;
+    }
+    if (e.type === "ifElse") {
+      for (const x of e.thenInner ?? []) if (walk(x)) return true;
+      for (const x of e.elseInner ?? []) if (walk(x)) return true;
     }
     return false;
   };
@@ -242,13 +287,34 @@ function hasUnknownEffect(effects) {
 
 function ensureCardCompiled(card) {
   if (!card) return [];
-  const eff = card.getEffects ? card.getEffects() : [];
-  if (!hasUnknownEffect(eff)) return eff;
+  const eff = parseCardEffects(card.text ?? "", card);
+  const needsRecompile = () => {
+    const walk = (e) => {
+      if (!e) return false;
+      if (e.type === "unknown") return true;
+      if (e.type === "attack") {
+        const raw = String(e.raw ?? "");
+        if (raw.includes("己方辅助") && e.target !== "allySupport") return true;
+        if (raw.includes("攻击焰") && e.flame !== true) return true;
+      }
+      if (e.type === "linked" || e.type === "conditional" || e.type === "block" || e.type === "onInsert" || e.type === "afterAll") {
+        for (const x of e.inner ?? []) if (walk(x)) return true;
+      }
+      if (e.type === "ifElse") {
+        for (const x of e.thenInner ?? []) if (walk(x)) return true;
+        for (const x of e.elseInner ?? []) if (walk(x)) return true;
+      }
+      return false;
+    };
+    for (const e of eff ?? []) if (walk(e)) return true;
+    return false;
+  };
+  if (!needsRecompile()) return eff;
   const text = card.text ?? "";
-  const next = parseCardEffects(text);
+  const next = parseCardEffects(text, card);
   const onInsert = next.filter((e) => e.type === "onInsert").flatMap((e) => e.inner);
-  card.getEffects = () => next;
-  card.getOnInsertEffects = () => onInsert;
+  card.getEffects = () => parseCardEffects(card.text ?? "", card);
+  card.getOnInsertEffects = () => parseCardEffects(card.text ?? "", card).filter((e) => e.type === "onInsert").flatMap((e) => e.inner);
   return next;
 }
 
@@ -258,8 +324,6 @@ function buildPlayerDeck(playerId, fighterDefs) {
   for (const f of fighterDefs) {
     for (let no = 1; no <= f.deckSize; no++) {
       const text = f.deckTextByNo.get(no) ?? "";
-      const effects = parseCardEffects(text);
-      const onInsertEffects = effects.filter((e) => e.type === "onInsert").flatMap((e) => e.inner);
       cards.push({
         id: cardId(playerId, f.name, no, serial++),
         fighterName: f.name,
@@ -268,8 +332,13 @@ function buildPlayerDeck(playerId, fighterDefs) {
         cardNo: no,
         cardName: f.deckNameByNo?.get(no) ?? "",
         text,
-        getEffects: () => effects,
-        getOnInsertEffects: () => onInsertEffects,
+        flipped: false,
+        getEffects: function () {
+          return parseCardEffects(this.text ?? "", this);
+        },
+        getOnInsertEffects: function () {
+          return this.getEffects().filter((e) => e.type === "onInsert").flatMap((e) => e.inner);
+        },
       });
     }
   }
@@ -280,23 +349,45 @@ function createInitialState(fighterPoolByName, picksByPlayer, startTopByPlayer) 
   function initPlayer(playerId) {
     const pickedNames = picksByPlayer[playerId] ?? [];
     const fighterDefs = pickedNames.map((n) => fighterPoolByName.get(n)).filter(Boolean);
+    const buildElf = (def) => {
+      const special = String(def?.special ?? "");
+      const spirits = [];
+      for (let i = 1; i <= 3; i++) {
+        const re = new RegExp(`灵${i}：HP上限为(\\d+)，HP规则：([^\\n]+)`);
+        const m = re.exec(special);
+        const maxHp = m ? Number(m[1]) : 0;
+        const hpRules = m ? parseHpRules(String(m[2]).trim()) : [];
+        spirits.push({ maxHp, hpRules });
+      }
+      return { soul: 1, spirits, active: null, dead: [false, false, false], pendingPick: true, pendingKoIndex: null, gameKo: false };
+    };
     const fighters = fighterDefs.map((f) => ({
       id: `${playerId}:${f.name}`,
       name: f.name,
       alias: f.id,
       code: f.code,
-      hp: f.beginHp,
-      maxHp: f.beginHp,
+      hp: f.name === "精灵族" ? 0 : f.beginHp,
+      maxHp: f.name === "精灵族" ? 0 : f.beginHp,
       power: f.beginPower,
       revelation: 0,
       battleship: 0,
       snake: f.name === "靡菲斯特" ? (Math.random() < 0.5 ? 0 : 1) : 0,
       snakeFlipMark: null,
       flame: {},
+      ning: f.name === "黄飞鸿" ? { [playerId]: 2 } : {},
+      guard: f.name === "魔像",
+      elf: f.name === "精灵族" ? buildElf(f) : null,
+      rage: f.name === "博德瓦尔" ? 0 : null,
+      bodvarForm: f.name === "博德瓦尔" ? "human" : null,
+      plan:
+        f.name === "米莱狄"
+          ? { available: Array.from({ length: Math.max(0, Number(f.planSize) || 0) }, (_, i) => i + 1), ready: [], discard: [] }
+          : null,
+      planTexts: f.name === "米莱狄" ? Array.from({ length: Math.max(0, Number(f.planSize) || 0) }, (_, i) => f.planTextByNo?.get(i + 1) ?? "") : null,
       police: false,
       koLine: f.koLine,
       koLines: Array.isArray(f.koLines) ? [...f.koLines] : null,
-      hpRules: f.hpRules,
+      hpRules: f.name === "精灵族" ? [] : f.hpRules,
     }));
     for (const def of fighterDefs) {
       if (def?.startBonus?.teammatePower) {
@@ -347,6 +438,15 @@ function createInitialState(fighterPoolByName, picksByPlayer, startTopByPlayer) 
     showDecks: false,
     awaitingConstruction: false,
     pendingGameOver: null,
+    pendingElfPickByPlayer: {
+      p1: p1.fighters.some((f) => f.name === "精灵族"),
+      p2: p2.fighters.some((f) => f.name === "精灵族"),
+    },
+    doubleNextByPlayer: {
+      p1: false,
+      p2: false,
+    },
+    pendingDoubleQueue: [],
     lastFlip: null,
     lastRound: null,
     lastIntermissionEffect: null,
@@ -388,6 +488,11 @@ function parseEffect(effectText) {
     const rest = s0.slice("结算后".length).trim().replace(/^[，,]/, "").trim();
     return parseEffect(rest);
   }
+  if (s0.startsWith("随后")) {
+    const rest = s0.slice("随后".length).trim().replace(/^[，,]/, "").trim();
+    const inner = splitEffectList(rest).map(parseEffect).filter(Boolean);
+    return { type: "afterAll", raw: s0, inner };
+  }
   if (s0.startsWith("警在己方：") || s0.startsWith("警在己方:")) {
     const rest = s0.slice(s0.indexOf("：") >= 0 ? "警在己方：".length : "警在己方:".length).trim();
     return parseEffect(`如果警在己方，${rest}`);
@@ -396,12 +501,32 @@ function parseEffect(effectText) {
     const rest = s0.slice(s0.indexOf("：") >= 0 ? "警在对方：".length : "警在对方:".length).trim();
     return parseEffect(`如果警在对方，${rest}`);
   }
+  if (s0.startsWith("如为人：") || s0.startsWith("如为人:")) {
+    const rest = s0.slice(s0.indexOf("：") >= 0 ? "如为人：".length : "如为人:".length).trim();
+    const inner = splitEffectList(rest).map(parseEffect).filter(Boolean);
+    return { type: "conditional", raw: s0, condRaw: "如为人", condFn: compileCondition("如为人"), inner };
+  }
+  if (s0.startsWith("如为熊：") || s0.startsWith("如为熊:")) {
+    const rest = s0.slice(s0.indexOf("：") >= 0 ? "如为熊：".length : "如为熊:".length).trim();
+    const inner = splitEffectList(rest).map(parseEffect).filter(Boolean);
+    return { type: "conditional", raw: s0, condRaw: "如为熊", condFn: compileCondition("如为熊"), inner };
+  }
   const sKeyAll = s0
     .replace(/\s+/g, "")
     .replaceAll("＋", "+")
     .replaceAll("－", "-")
     .replaceAll("，", "")
     .replaceAll(",", "");
+
+  if ((s0.startsWith("如果") || s0.startsWith("如")) && (s0.includes("否则，") || s0.includes("否则,"))) {
+    const m = /^(如果|如)(.+?)(?:，|,)(.+?)(?:，|,)?否则(?:，|,)(.+)$/.exec(s0);
+    if (m) {
+      const condRaw = `${m[1]}${m[2]}`;
+      const thenInner = splitEffectList(String(m[3]).trim()).map(parseEffect).filter(Boolean);
+      const elseInner = splitEffectList(String(m[4]).trim()).map(parseEffect).filter(Boolean);
+      return { type: "ifElse", raw: s0, condRaw, condFn: compileCondition(condRaw), thenInner, elseInner };
+    }
+  }
 
   if (s0.startsWith("入库时")) {
     const rest = s0.slice("入库时".length).trim();
@@ -422,7 +547,32 @@ function parseEffect(effectText) {
 
   if (sKeyAll === "烈焰") return { type: "flame", raw: s0 };
 
+  if (sKeyAll === "卡牌结算结束后将此牌和对手的牌移除游戏") return { type: "removeFromGameBothAfter", raw: s0 };
+
+  if (sKeyAll === "判定精灵族被KO游戏结束") return { type: "elfKo", raw: s0 };
+
+  if (sKeyAll === "护移交辅助" || sKeyAll === "护移交队友") return { type: "guardToSupport", raw: s0 };
+
+  if (sKeyAll === "下回合抽出的卡牌效果结算2次") return { type: "golemRebirth", raw: s0 };
+
+  const ningPlace = /^将(\d+)个凝置于对方主攻$/.exec(sKeyAll);
+  if (ningPlace) return { type: "ningPlace", raw: s0, amount: Number(ningPlace[1]) };
+
+  if (sKeyAll === "收回所有凝") return { type: "ningRecall", raw: s0, amount: null };
+  const ningRecall = /^收回(\d+)个凝$/.exec(sKeyAll);
+  if (ningRecall) return { type: "ningRecall", raw: s0, amount: Number(ningRecall[1]) };
+  if (sKeyAll === "收回凝" || sKeyAll === "收回本回合放的凝" || sKeyAll === "收回本回合放的凝至黄飞鸿手中") {
+    return { type: "ningRecallThisTurn", raw: s0 };
+  }
+
   if (s0.startsWith("如果") && !s0.includes("则") && (s0.includes("，") || s0.includes(","))) {
+    const idx = s0.indexOf("，") >= 0 ? s0.indexOf("，") : s0.indexOf(",");
+    const cond = s0.slice(0, idx).trim();
+    const tail = s0.slice(idx + 1).trim();
+    const inner = splitEffectList(tail).map(parseEffect).filter(Boolean);
+    return { type: "conditional", raw: s0, condRaw: cond, condFn: compileCondition(cond), inner };
+  }
+  if (s0.startsWith("如") && !s0.includes("则") && (s0.includes("，") || s0.includes(","))) {
     const idx = s0.indexOf("，") >= 0 ? s0.indexOf("，") : s0.indexOf(",");
     const cond = s0.slice(0, idx).trim();
     const tail = s0.slice(idx + 1).trim();
@@ -495,6 +645,22 @@ function parseEffect(effectText) {
   if (headKey === "取消回复效果") return { type: "cancelOpponentHeal", raw: s0 };
   if (headKey === "回复对方原回复量") return { type: "stealOpponentHeal", raw: s0 };
 
+  const rageUp = /^怒\+(\d+)$/.exec(headKey);
+  if (rageUp) return { type: "rage", raw: s0, amount: Number(rageUp[1]) };
+
+  if (headKey === "制定计划") return { type: "planDraft", raw: s0 };
+  if (headKey === "实施计划" || headKey === "实施一条计划") return { type: "planExecute", raw: s0 };
+  if (headKey === "毒") return { type: "poison", raw: s0 };
+
+  if (headKey === "翻转") return { type: "flip", raw: s0 };
+
+  if (headKey === "以其力量攻击") return { type: "attackByOppMainPower", raw: s0, inner };
+
+  if (headKey === "使力量等于辅助力量") return { type: "setPowerToSupportPower", raw: s0 };
+
+  const summon = /^召唤：(.+)$/.exec(headNorm);
+  if (summon) return { type: "summon", raw: s0, name: summon[1].trim() };
+
   const shipDelta = /^战船\+(\d+)$/.exec(headKey);
   if (shipDelta) return { type: "battleship", raw: s0, delta: Number(shipDelta[1]) };
 
@@ -509,14 +675,24 @@ function parseEffect(effectText) {
 
   if (headKey.startsWith("攻击焰") || headKey.startsWith("攻击") || headKey.startsWith("双战攻击")) {
     const flame = headKey.startsWith("攻击焰");
-    const attackerMode = headKey.includes("己方辅助") ? "support" : headKey.startsWith("双战") ? "double" : "single";
+    const attackerMode = headKey.startsWith("双战") ? "double" : "single";
     const defenderMode = headKey.includes("攻击双战") || headKey.includes("焰双战") || headKey.endsWith("双战") ? "double" : "single";
-    const target = headKey.includes("对方辅助") ? "enemySupport" : "enemyMain";
-    return { type: "attack", raw: s0, attackerMode, defenderMode, target, inner, flame };
+    let target = "enemyMain";
+    if (headKey.includes("对方辅助")) target = "enemySupport";
+    else if (headKey.includes("己方辅助")) target = "allySupport";
+    const bonusMode = headKey.includes("攻击力额外附加魂数") ? "soul" : null;
+    return { type: "attack", raw: s0, attackerMode, defenderMode, target, inner, flame, bonusMode };
   }
+
+  const healSupportSoul = /^辅助回复(\d+)x魂$/.exec(headKey);
+  if (healSupportSoul) return { type: "heal", raw: s0, target: "allySupport", amountMode: "soulMul", base: Number(healSupportSoul[1]) };
 
   const healSupport = /^辅助回复(\d+)$/.exec(headKey);
   if (healSupport) return { type: "heal", raw: s0, target: "allySupport", amount: Number(healSupport[1]) };
+
+  if (headKey === "辅助回复等于主攻力量" || headKey === "辅助回复等于主攻力量值") {
+    return { type: "heal", raw: s0, target: "allySupport", amountMode: "startPowerMain" };
+  }
 
   const healBoth = /^(?:己方)?双战回复(\d+)$/.exec(headKey);
   if (healBoth) return { type: "heal", raw: s0, target: "allyBoth", amount: Number(healBoth[1]) };
@@ -542,6 +718,14 @@ function parseEffect(effectText) {
 
   const supportDirect = /^辅助受(\d+)直伤$/.exec(headKey);
   if (supportDirect) return { type: "direct", raw: s0, target: "allySupport", amount: Number(supportDirect[1]) };
+
+  const namedDirect = /^(.+?)受(\d+)直伤$/.exec(headKey);
+  if (namedDirect) {
+    return { type: "direct", raw: s0, target: { kind: "named", name: namedDirect[1].trim() }, amount: Number(namedDirect[2]) };
+  }
+
+  const allDirect = /^4位战士各受(\d+)直伤$/.exec(headKey);
+  if (allDirect) return { type: "directAll", raw: s0, amount: Number(allDirect[1]) };
 
   const direct = /^直伤(\d+)(.*)$/.exec(headKey);
   if (direct) {
@@ -586,9 +770,16 @@ function parseEffect(effectText) {
   return { type: "unknown", raw: s0 };
 }
 
-function parseCardEffects(cardText) {
-  const s = String(cardText ?? "").trim();
+function parseCardEffects(cardText, card) {
+  let s = String(cardText ?? "").trim();
   if (!s) return [];
+  const idx = s.indexOf("//");
+  if (idx >= 0) {
+    const before = s.slice(0, idx).trim();
+    const after = s.slice(idx + 2).trim();
+    if (after) s = card?.flipped === true ? after : before;
+    else s = before;
+  }
   return splitEffectList(s).map(parseEffect).filter(Boolean);
 }
 
@@ -716,6 +907,47 @@ function compileCondition(condRaw) {
   let s = s0.replace(/^(如果|如)/, "").trim().replace(/\s+/g, "").replaceAll("＋", "+").replaceAll("－", "-");
   s = s.replace(/[，,；;。]+$/g, "");
 
+  if (s === "为人" || s === "为熊") {
+    return (ctx, runtime) => {
+      const f = runtime?.fighterById?.get?.(ctx.my.mainId);
+      const form = runtime?.formAtStart ?? f?.bodvarForm ?? "human";
+      return s === "为熊" ? form === "bear" : form !== "bear";
+    };
+  }
+
+  if (s === "被攻击" || s === "自身被攻击" || s === "自身遭受攻击") {
+    return (ctx, runtime) => {
+      const m = runtime?.wasAttackedByPlayerId;
+      if (m && typeof m.get === "function") return m.get(ctx?.my?.playerId) === true;
+      if (runtime && Object.prototype.hasOwnProperty.call(runtime, "miladyWasAttacked")) return runtime.miladyWasAttacked === true;
+      return runtime?.oppAttacking === true;
+    };
+  }
+
+  if (s === "攻击被格挡") {
+    return (_, runtime) => runtime?.attackBlocked === true;
+  }
+
+  if (s === "对方已有凝") {
+    return (ctx, runtime) => {
+      if (runtime && Object.prototype.hasOwnProperty.call(runtime, "oppMainHadNing")) return runtime.oppMainHadNing === true;
+      const ownerPid = ctx?.my?.playerId;
+      const f = runtime?.fighterById?.get?.(ctx?.opp?.mainId);
+      const v = f?.ning && typeof f.ning === "object" ? Number(f.ning[ownerPid]) || 0 : 0;
+      return v > 0;
+    };
+  }
+
+  const hpEq = /^HP=(\d+)$/.exec(s);
+  if (hpEq) {
+    const threshold = Number(hpEq[1]);
+    return (ctx, runtime) => {
+      const id = ctx.my.mainId;
+      const v = runtime?.hpAt ? Number(runtime.hpAt(id)) || 0 : Number(runtime?.fighterById?.get?.(id)?.hp) || 0;
+      return v === threshold;
+    };
+  }
+
   const m1 = /^己方辅助力量>(\d+)$/.exec(s);
   if (m1) {
     const threshold = Number(m1[1]);
@@ -731,6 +963,37 @@ function compileCondition(condRaw) {
     return (ctx) => {
       const v = ctx.startPower.get(ctx.my.mainId) ?? 0;
       return v >= threshold;
+    };
+  }
+
+  const soulEq = /^本回合开始时魂=(\d+)$/.exec(s);
+  if (soulEq) {
+    const threshold = Number(soulEq[1]);
+    return (_, runtime) => Number(runtime?.soulAtStart) === threshold;
+  }
+
+  if (s === "护在魔像") {
+    return (ctx, runtime) => {
+      const pid = ctx?.my?.playerId;
+      if (!pid) return false;
+      const golem = [...(runtime?.fighterById?.values?.() ?? [])].find((x) => x?.name === "魔像" && String(x.id).startsWith(`${pid}:`));
+      return golem?.guard === true;
+    };
+  }
+
+  if (s === "护在辅助" || s === "护在队友") {
+    return (ctx, runtime) => {
+      const pid = ctx?.my?.playerId;
+      if (!pid) return false;
+      const byId = runtime?.fighterById;
+      const values = byId?.values?.() ?? [];
+      const all = [...values];
+      const golem = all.find((x) => x?.name === "魔像" && String(x.id).startsWith(`${pid}:`)) ?? null;
+      const teammate =
+        (golem ? all.find((x) => String(x.id).startsWith(`${pid}:`) && x.id !== golem.id) : null) ??
+        (ctx?.my?.bothIds ? all.find((x) => (ctx.my.bothIds ?? []).includes(x.id) && x?.name !== "魔像") : null) ??
+        null;
+      return teammate?.guard === true;
     };
   }
 
@@ -762,6 +1025,7 @@ function compileCondition(condRaw) {
     return (ctx, runtime) => {
       const f = runtime?.fighterById?.get?.(ctx.my.mainId);
       const v = Number(f?.battleship) || 0;
+      if (threshold === 7) return v <= 7;
       return v < threshold;
     };
   }
@@ -874,12 +1138,19 @@ function condOk(effect, ctx, runtime) {
 function effectsMayContainAttack(effects) {
   for (const e of effects ?? []) {
     if (!e) continue;
-    if (e.type === "attack") return true;
+    if (e.type === "attack" || e.type === "attackByOppMainPower") return true;
     if (e.type === "block") {
       if (effectsMayContainAttack(e.inner)) return true;
     }
     if (e.type === "conditional") {
       if (effectsMayContainAttack(e.inner)) return true;
+    }
+    if (e.type === "afterAll") {
+      if (effectsMayContainAttack(e.inner)) return true;
+    }
+    if (e.type === "ifElse") {
+      if (effectsMayContainAttack(e.thenInner)) return true;
+      if (effectsMayContainAttack(e.elseInner)) return true;
     }
   }
   return false;
@@ -888,11 +1159,22 @@ function effectsMayContainAttack(effects) {
 function hasAutoAttack(effects, ctx, runtime) {
   for (const e of effects ?? []) {
     if (!e) continue;
-    if (e.type === "attack") return true;
+    if (e.type === "attack" || e.type === "attackByOppMainPower") return true;
     if (e.type === "block") continue;
     if (e.type === "conditional") {
       if (condOk(e, ctx, runtime)) {
         if (hasAutoAttack(e.inner, ctx, runtime)) return true;
+      }
+    }
+    if (e.type === "afterAll") {
+      if (hasAutoAttack(e.inner, ctx, runtime)) return true;
+    }
+    if (e.type === "ifElse") {
+      const ok = condOk(e, ctx, runtime);
+      if (ok) {
+        if (hasAutoAttack(e.thenInner, ctx, runtime)) return true;
+      } else {
+        if (hasAutoAttack(e.elseInner, ctx, runtime)) return true;
       }
     }
   }
@@ -902,14 +1184,59 @@ function hasAutoAttack(effects, ctx, runtime) {
 function hasAttackForBlock(effects, ctx, runtime) {
   for (const e of effects) {
     if (!e) continue;
-    if (e.type === "attack") return true;
+    if (e.type === "attack" || e.type === "attackByOppMainPower") return true;
     if (e.type === "conditional") {
       if (condOk(e, ctx, runtime)) {
         if (hasAttackForBlock(e.inner, ctx, runtime)) return true;
       }
     }
+    if (e.type === "afterAll") {
+      if (hasAttackForBlock(e.inner, ctx, runtime)) return true;
+    }
+    if (e.type === "ifElse") {
+      const ok = condOk(e, ctx, runtime);
+      if (ok) {
+        if (hasAttackForBlock(e.thenInner, ctx, runtime)) return true;
+      } else {
+        if (hasAttackForBlock(e.elseInner, ctx, runtime)) return true;
+      }
+    }
     if (e.type === "linked") {
       if (hasAttackForBlock(e.inner, ctx, runtime)) return true;
+    }
+  }
+  return false;
+}
+
+function hasAttackTargetingEnemyMain(effects, ctx, runtime) {
+  for (const e of effects ?? []) {
+    if (!e) continue;
+    if (e.type === "attack") {
+      if (e.defenderMode === "double") return true;
+      if (e.target === "enemyMain") return true;
+      continue;
+    }
+    if (e.type === "conditional") {
+      if (condOk(e, ctx, runtime)) {
+        if (hasAttackTargetingEnemyMain(e.inner, ctx, runtime)) return true;
+      }
+      continue;
+    }
+    if (e.type === "afterAll") {
+      if (hasAttackTargetingEnemyMain(e.inner, ctx, runtime)) return true;
+      continue;
+    }
+    if (e.type === "ifElse") {
+      const ok = condOk(e, ctx, runtime);
+      if (ok) {
+        if (hasAttackTargetingEnemyMain(e.thenInner, ctx, runtime)) return true;
+      } else {
+        if (hasAttackTargetingEnemyMain(e.elseInner, ctx, runtime)) return true;
+      }
+      continue;
+    }
+    if (e.type === "linked") {
+      if (hasAttackTargetingEnemyMain(e.inner, ctx, runtime)) return true;
     }
   }
   return false;
@@ -923,13 +1250,25 @@ function settleEffects({
   oppEffects,
   myPlayer,
   oppPlayer,
+  onlySide,
+  guardAtStartById: guardAtStartByIdIn,
 }) {
   const log = [];
   const hpDelta = new Map();
   const powerDelta = new Map();
+  const planEvents = [];
+  let removeBothCardsFromGame = false;
+  const flameKoByPlayerId = new Set();
+  const golemRebirthByPlayerId = new Set();
+  const guardBlockedByPlayerId = new Set();
+  const flipTriggeredByCardId = new Set();
   const fighterById = new Map(
     [...myPlayer.fighters, ...oppPlayer.fighters].map((f) => [f.id, f])
   );
+  const guardAtStartById =
+    guardAtStartByIdIn && typeof guardAtStartByIdIn.get === "function"
+      ? guardAtStartByIdIn
+      : new Map([...fighterById.entries()].map(([id, f]) => [id, f?.guard === true]));
   const powerOpsP1 = [];
   const powerOpsP2 = [];
   const hpShield = new Set();
@@ -952,6 +1291,8 @@ function settleEffects({
       log,
       hpDelta,
       powerDelta,
+      planEvents,
+      removeBothCardsFromGame,
       myCanceled: true,
       oppCanceled: true,
       myBlockSuccess: false,
@@ -959,6 +1300,9 @@ function settleEffects({
       winOnSelfKoByPlayer,
     };
   }
+
+  const applyP1 = !onlySide || onlySide === ctx?.my?.playerId;
+  const applyP2 = !onlySide || onlySide === ctx?.opp?.playerId;
 
   const p1Attacking =
     !p1Canceled &&
@@ -975,12 +1319,51 @@ function settleEffects({
     });
   const p1HasBlock = !p1Canceled && myEffects.some((e) => e.type === "block");
   const p2HasBlock = !p2Canceled && oppEffects.some((e) => e.type === "block");
+  const p1BlockInner = p1HasBlock ? myEffects.filter((e) => e.type === "block").flatMap((e) => e.inner ?? []) : [];
+  const p2BlockInner = p2HasBlock ? oppEffects.filter((e) => e.type === "block").flatMap((e) => e.inner ?? []) : [];
+  const blockInnerByPlayerId = { p1: p1BlockInner, p2: p2BlockInner };
+  const blockActiveByPlayerId = { p1: p1HasBlock && !p1Canceled, p2: p2HasBlock && !p2Canceled };
+  const wasAttackedByPlayerId = new Map([
+    ["p1", false],
+    ["p2", false],
+  ]);
   const p1BlockSuccess = p1HasBlock && p2Attacking;
   const p2BlockSuccess = p2HasBlock && p1Attacking;
+  const p1MiladyWasAttacked = (() => {
+    const me = fighterById.get(ctx.my.mainId);
+    if (me?.name !== "米莱狄") return false;
+    if (p2Canceled) return false;
+    return hasAttackTargetingEnemyMain(oppEffects, flipContext(ctx), {
+      myEffects: oppEffects,
+      oppEffects: myEffects,
+      fighterById,
+      card: oppCard,
+      oppCard: myCard,
+      startPoliceOwnerPlayerId,
+    });
+  })();
+  const p2MiladyWasAttacked = (() => {
+    const me = fighterById.get(ctx.opp.mainId);
+    if (me?.name !== "米莱狄") return false;
+    if (p1Canceled) return false;
+    return hasAttackTargetingEnemyMain(myEffects, ctx, {
+      myEffects,
+      oppEffects,
+      fighterById,
+      card: myCard,
+      oppCard,
+      startPoliceOwnerPlayerId,
+    });
+  })();
   const deferredAfterOppP1 = [];
   const deferredAfterOppP2 = [];
+  const deferredAfterAllP1 = [];
+  const deferredAfterAllP2 = [];
   const cancelHealByPlayerId = new Map();
   const mapFor = (playerId) => (playerId === myPlayer.id ? myPlayer.fightersByName : oppPlayer.fightersByName);
+  const stopHpById = new Set();
+  const poisonQueue = [];
+  const ningPlacedThisTurn = new Map();
 
   function getKoFloor(f) {
     if (Array.isArray(f?.koLines) && f.koLines.length > 0) {
@@ -1002,13 +1385,53 @@ function settleEffects({
     f.flame[ownerPlayerId] = Math.max(0, Math.min(5, Number(n) || 0));
   }
 
+  function ningCountByOwner(f, ownerPlayerId) {
+    if (!f) return 0;
+    const v = f?.ning?.[ownerPlayerId];
+    return Number.isFinite(v) ? Number(v) : 0;
+  }
+
+  function setNingCountByOwner(f, ownerPlayerId, n) {
+    if (!f) return;
+    if (!f.ning || typeof f.ning !== "object") f.ning = {};
+    f.ning[ownerPlayerId] = Math.max(0, Math.min(2, Number(n) || 0));
+  }
+
+  function recordNingPlaced(ownerPid, targetId, n) {
+    if (!ownerPid || !targetId) return;
+    const d = Math.max(0, Number(n) || 0);
+    if (!d) return;
+    let m = ningPlacedThisTurn.get(ownerPid);
+    if (!m) {
+      m = new Map();
+      ningPlacedThisTurn.set(ownerPid, m);
+    }
+    m.set(targetId, (m.get(targetId) ?? 0) + d);
+  }
+
   function addHp(id, delta, opts) {
+    if (stopHpById.has(id)) return;
+    const f = fighterById.get(id);
+    if (f?.name === "精灵族" && f?.elf && f.elf.active == null) return;
     const force = opts?.force === true;
     if (!force && hpShield.has(id)) return;
     const d = Number(delta) || 0;
     if (!d) return;
     hpDelta.set(id, (hpDelta.get(id) ?? 0) + d);
   }
+
+  const hpAt = (id) => {
+    const f = fighterById.get(id);
+    const base = f?.hp ?? 0;
+    let next = base + (hpDelta.get(id) ?? 0);
+    const maxHp = Number(f?.maxHp);
+    if (Number.isFinite(maxHp)) next = Math.min(next, maxHp);
+    if (f) {
+      if (f.name === "玛曼布丽吉特") next = Math.max(next, -2);
+      else next = Math.max(next, getKoFloor(f));
+    }
+    return next;
+  };
 
   function addPower(id, delta) {
     powerDelta.set(id, (powerDelta.get(id) ?? 0) + delta);
@@ -1059,6 +1482,7 @@ function settleEffects({
   function computeHealAmount(effect, sideCtx, runtime) {
     if (Number.isFinite(effect.amount)) return Number(effect.amount) || 0;
     if (effect.amountMode === "startPowerMain") return sideCtx.startPower.get(sideCtx.my.mainId) ?? 0;
+    if (effect.amountMode === "soulMul") return (Number(effect.base) || 0) * (Number(runtime?.soulAtStart) || 0);
     if (effect.amountMode === "blockedAttackStartPower") {
       const atkCtx = flipContext(sideCtx);
       const atkRuntime = runtime
@@ -1114,6 +1538,11 @@ function settleEffects({
     if (canceledSelf) return;
     if (effect.type === "unknown") {
       log.push(`未实现效果：${effect.raw}`);
+      return;
+    }
+    if (effect.type === "afterAll") {
+      const q = runtime?.deferredAfterAll;
+      if (Array.isArray(q)) q.push({ sideCtx, effects: effect.inner ?? [], canceledSelf, opponentBlockSuccess, blockSuccess, playerMap, queuePower, runtime, linkId });
       return;
     }
     if (effect.type === "cancel") return;
@@ -1177,6 +1606,247 @@ function settleEffects({
       log.push(`${runtime?.prefix ?? ""}警：移动到 ${name}`);
       return;
     }
+    if (effect.type === "removeFromGameBothAfter") {
+      removeBothCardsFromGame = true;
+      log.push(`${runtime?.prefix ?? ""}${effect.raw}`);
+      return;
+    }
+    if (effect.type === "elfKo") {
+      const elfRef = playerMap.get("精灵族");
+      if (!elfRef) return;
+      const f = fighterById.get(elfRef.id);
+      if (!f) return;
+      if (!f.elf || typeof f.elf !== "object") f.elf = { soul: 0, spirits: [], active: null, dead: [false, false, false], pendingPick: false, gameKo: false };
+      f.elf.gameKo = true;
+      log.push(`${runtime?.prefix ?? ""}${effect.raw}`);
+      return;
+    }
+    if (effect.type === "flip") {
+      if (runtime?.card && typeof runtime.card === "object") {
+        runtime.card.flipped = true;
+        if (runtime?.flipTriggeredByCardId && typeof runtime.flipTriggeredByCardId.add === "function" && runtime.card.id)
+          runtime.flipTriggeredByCardId.add(runtime.card.id);
+      }
+      return;
+    }
+    if (effect.type === "summon") {
+      log.push(`${runtime?.prefix ?? ""}${effect.raw}`);
+      return;
+    }
+    if (effect.type === "setPowerToSupportPower") {
+      const mainId = sideCtx.my.mainId;
+      const supportId = sideCtx.my.supportId;
+      const target = sideCtx.startPower.get(supportId) ?? 0;
+      const cur = (fighterById.get(mainId)?.power ?? 0) + (powerDelta.get(mainId) ?? 0);
+      addPower(mainId, target - cur);
+      log.push(`${runtime?.prefix ?? ""}力量：${fighterById.get(mainId)?.name ?? "?"} 设为辅助力量 ${target}`);
+      return;
+    }
+    if (effect.type === "ningPlace") {
+      const ownerPid = sideCtx.my.playerId;
+      const huangRef = playerMap.get("黄飞鸿");
+      if (!huangRef) return;
+      const huang = fighterById.get(huangRef.id);
+      const target = fighterById.get(sideCtx.opp.mainId);
+      if (!huang || !target) return;
+      const amount = Math.max(0, Number(effect.amount) || 0);
+      const targetCur = ningCountByOwner(target, ownerPid);
+      let need = Math.max(0, Math.min(amount, 2 - targetCur));
+      if (!need) return;
+      let moved = 0;
+      const available = ningCountByOwner(huang, ownerPid);
+      const takeFromHuang = Math.max(0, Math.min(available, need));
+      if (takeFromHuang) {
+        setNingCountByOwner(huang, ownerPid, available - takeFromHuang);
+        moved += takeFromHuang;
+        need -= takeFromHuang;
+      }
+      if (need > 0) {
+        const srcIds = [sideCtx.opp.supportId, sideCtx.my.supportId, sideCtx.my.mainId].filter(Boolean);
+        for (const id of srcIds) {
+          if (need <= 0) break;
+          if (id === target.id) continue;
+          if (id === huang.id) continue;
+          const src = fighterById.get(id);
+          if (!src) continue;
+          const cur = ningCountByOwner(src, ownerPid);
+          const take = Math.max(0, Math.min(cur, need));
+          if (!take) continue;
+          setNingCountByOwner(src, ownerPid, cur - take);
+          moved += take;
+          need -= take;
+        }
+      }
+      if (!moved) return;
+      setNingCountByOwner(target, ownerPid, targetCur + moved);
+      recordNingPlaced(ownerPid, target.id, moved);
+      log.push(`${runtime?.prefix ?? ""}凝：置于 ${target.name}（${moved}）`);
+      return;
+    }
+    if (effect.type === "ningRecallThisTurn") {
+      const ownerPid = sideCtx.my.playerId;
+      const huangRef = playerMap.get("黄飞鸿");
+      if (!huangRef) return;
+      const huang = fighterById.get(huangRef.id);
+      if (!huang) return;
+      const m = ningPlacedThisTurn.get(ownerPid);
+      if (!m || m.size === 0) {
+        log.push(`${runtime?.prefix ?? ""}凝：收回本回合放的凝（0）`);
+        return;
+      }
+      let recalled = 0;
+      for (const [targetId, n] of m.entries()) {
+        const t = fighterById.get(targetId);
+        if (!t) continue;
+        const cur = ningCountByOwner(t, ownerPid);
+        const take = Math.max(0, Math.min(cur, Math.max(0, Number(n) || 0)));
+        if (!take) continue;
+        setNingCountByOwner(t, ownerPid, cur - take);
+        recalled += take;
+      }
+      ningPlacedThisTurn.set(ownerPid, new Map());
+      setNingCountByOwner(huang, ownerPid, ningCountByOwner(huang, ownerPid) + recalled);
+      log.push(`${runtime?.prefix ?? ""}凝：收回本回合放的凝（${recalled}）`);
+      return;
+    }
+    if (effect.type === "ningRecall") {
+      const ownerPid = sideCtx.my.playerId;
+      const huangRef = playerMap.get("黄飞鸿");
+      if (!huangRef) return;
+      const huang = fighterById.get(huangRef.id);
+      if (!huang) return;
+      const curHuang = ningCountByOwner(huang, ownerPid);
+      const wantRaw = effect.amount;
+      const want = wantRaw == null ? null : Math.max(0, Number(wantRaw) || 0);
+      let recalled = 0;
+      if (want == null) {
+        for (const f of fighterById.values()) {
+          if (f.id === huang.id) continue;
+          recalled += ningCountByOwner(f, ownerPid);
+          setNingCountByOwner(f, ownerPid, 0);
+        }
+      } else if (want > 0) {
+        let remain = want;
+        const order = [sideCtx.opp.mainId, sideCtx.opp.supportId, sideCtx.my.supportId];
+        for (const id of order) {
+          if (remain <= 0) break;
+          const f = fighterById.get(id);
+          if (!f || f.id === huang.id) continue;
+          const cur = ningCountByOwner(f, ownerPid);
+          const take = Math.max(0, Math.min(cur, remain));
+          if (!take) continue;
+          setNingCountByOwner(f, ownerPid, cur - take);
+          recalled += take;
+          remain -= take;
+        }
+        if (remain > 0) {
+          for (const f of fighterById.values()) {
+            if (remain <= 0) break;
+            if (f.id === huang.id) continue;
+            if (order.includes(f.id)) continue;
+            const cur = ningCountByOwner(f, ownerPid);
+            const take = Math.max(0, Math.min(cur, remain));
+            if (!take) continue;
+            setNingCountByOwner(f, ownerPid, cur - take);
+            recalled += take;
+            remain -= take;
+          }
+        }
+      }
+      setNingCountByOwner(huang, ownerPid, curHuang + recalled);
+      log.push(`${runtime?.prefix ?? ""}凝：收回${recalled}`);
+      return;
+    }
+    if (effect.type === "attackByOppMainPower") {
+      const dmg = sideCtx.startPower.get(sideCtx.opp.mainId) ?? 0;
+      const prefix = runtime?.prefix ?? "";
+      const n = fighterById.get(sideCtx.opp.mainId)?.name ?? sideCtx.opp.mainId;
+      if (!opponentBlockSuccess) {
+        addHp(sideCtx.opp.mainId, -dmg);
+        log.push(`${prefix}${runtime?.card?.fighterName ?? "?"} 攻击：以对方力量对 ${n} 造成 ${dmg}`);
+      } else {
+        log.push(`${prefix}${runtime?.card?.fighterName ?? "?"} 攻击：被格挡`);
+      }
+      if (effect.inner?.length) {
+        for (const inner of effect.inner)
+          applyAtomicEffect(sideCtx, inner, canceledSelf, opponentBlockSuccess, blockSuccess, playerMap, queuePower, runtime, linkId);
+      }
+      return;
+    }
+    function tryBodvarTransform(f) {
+      if (!f || f.name !== "博德瓦尔") return false;
+      if (f.bodvarForm === "bear") return false;
+      stopHpById.add(f.id);
+      hpDelta.delete(f.id);
+      addPower(f.id, 3);
+      const nextPower = (Number(f.power) || 0) + (powerDelta.get(f.id) ?? 0);
+      f.bodvarForm = "bear";
+      f.rage = 7;
+      f.maxHp = 15;
+      f.hp = Math.min(15, nextPower);
+      f.hpRules = [];
+      log.push(`${runtime?.prefix ?? ""}变身：博德瓦尔 怒=7，停止本回合博德瓦尔自身伤害/回复结算，力量+3，切换为熊，HP上限=15，HP=${f.hp}`);
+      return true;
+    }
+    if (effect.type === "rage") {
+      const f = fighterById.get(sideCtx.my.mainId);
+      if (!f || f.name !== "博德瓦尔") return;
+      if (f.bodvarForm === "bear") return;
+      const before = Math.max(0, Math.min(7, Number(f.rage) || 0));
+      const d = Math.max(0, Number(effect.amount) || 0);
+      const next = Math.max(0, Math.min(7, before + d));
+      f.rage = next;
+      log.push(`${runtime?.prefix ?? ""}怒：博德瓦尔 ${before}→${next}`);
+      if (before < 7 && next >= 7) {
+        tryBodvarTransform(f);
+      }
+      return;
+    }
+    if (effect.type === "planDraft" || effect.type === "planExecute") {
+      const miladyRef = playerMap.get("米莱狄");
+      const milady = miladyRef ? fighterById.get(miladyRef.id) : null;
+      if (!milady || !milady.plan || !Array.isArray(milady.planTexts)) return;
+      const plan = milady.plan;
+      const prefix = runtime?.prefix ?? "";
+      if (effect.type === "planDraft") {
+        if (!Array.isArray(plan.available) || plan.available.length === 0) {
+          log.push(`${prefix}计划：无可制定`);
+          planEvents.push({ playerId: sideCtx.my.playerId, source: "card", kind: "draft", planNo: null, planText: "", result: "empty" });
+          return;
+        }
+        const idx = Math.floor(Math.random() * plan.available.length);
+        const no = plan.available.splice(idx, 1)[0];
+        plan.ready.push(no);
+        log.push(`${prefix}制定计划：#${no}`);
+        planEvents.push({ playerId: sideCtx.my.playerId, source: "card", kind: "draft", planNo: no, planText: String(milady.planTexts[no - 1] ?? ""), result: "ok" });
+        return;
+      }
+      if (!Array.isArray(plan.ready) || plan.ready.length === 0) {
+        log.push(`${prefix}实施计划：无可实施`);
+        planEvents.push({ playerId: sideCtx.my.playerId, source: "card", kind: "execute", planNo: null, planText: "", result: "empty" });
+        return;
+      }
+      const depth = Number(runtime?.planDepth) || 0;
+      if (depth >= 20) {
+        log.push(`${prefix}实施计划：递归过深，终止`);
+        planEvents.push({ playerId: sideCtx.my.playerId, source: "card", kind: "execute", planNo: null, planText: "递归过深，终止", result: "stop" });
+        return;
+      }
+      const idx = Math.floor(Math.random() * plan.ready.length);
+      const no = plan.ready.splice(idx, 1)[0];
+      plan.discard.push(no);
+      const text = String(milady.planTexts[no - 1] ?? "").trim();
+      log.push(`${prefix}实施计划：#${no}${text ? `（${text}）` : ""}`);
+      planEvents.push({ playerId: sideCtx.my.playerId, source: "card", kind: "execute", planNo: no, planText: text, result: "ok" });
+      const planEffects = text ? parseCardEffects(text) : [];
+      const nextRuntime = runtime && typeof runtime === "object" ? { ...runtime, planDepth: depth + 1 } : runtime;
+      for (const pe of planEffects) applyAtomicEffect(sideCtx, pe, canceledSelf, opponentBlockSuccess, blockSuccess, playerMap, queuePower, nextRuntime, linkId);
+      return;
+    }
+    if (effect.type === "poison") {
+      poisonQueue.push({ prefix: runtime?.prefix ?? "", sideCtx, raw: effect.raw });
+      return;
+    }
     if (effect.type === "flame") {
       const ownerPid = sideCtx.my.playerId;
       const mainId = sideCtx.opp.mainId;
@@ -1198,9 +1868,10 @@ function settleEffects({
         }
       }
       if (nextMain >= 5) {
-        const curHp = (main.hp ?? 0) + (hpDelta.get(mainId) ?? 0);
-        const koFloor = getKoFloor(main);
-        if (curHp > koFloor) addHp(mainId, koFloor - curHp, { force: true });
+        main.koByFlame = true;
+        flameKoByPlayerId.add(sideCtx.opp.playerId);
+        hpDelta.delete(mainId);
+        stopHpById.add(mainId);
         log.push(`${runtime?.prefix ?? ""}焰：${main.name} 焰=5 被KO`);
       }
       return;
@@ -1296,41 +1967,135 @@ function settleEffects({
       }
       return;
     }
-    if (effect.type === "block") {
-      if (blockSuccess && effect.inner.length) {
-        for (const inner of effect.inner)
-          applyAtomicEffect(sideCtx, inner, canceledSelf, opponentBlockSuccess, blockSuccess, playerMap, queuePower, runtime, linkId);
+    if (effect.type === "ifElse") {
+      const ok = condOk(effect, sideCtx, runtime);
+      const arr = ok ? effect.thenInner : effect.elseInner;
+      for (const inner of arr ?? []) {
+        applyAtomicEffect(sideCtx, inner, canceledSelf, opponentBlockSuccess, blockSuccess, playerMap, queuePower, runtime, linkId);
       }
       return;
     }
+    if (effect.type === "guardToSupport") {
+      const ownerPid = sideCtx.my.playerId;
+      const golem = [...fighterById.values()].find((x) => x?.name === "魔像" && String(x.id).startsWith(`${ownerPid}:`));
+      if (!golem) return;
+      const teammateId =
+        (sideCtx.my.bothIds ?? []).find((id) => id && id !== golem.id) ??
+        [...fighterById.values()].find((x) => String(x.id).startsWith(`${ownerPid}:`) && x.id !== golem.id)?.id ??
+        null;
+      const teammate = teammateId ? fighterById.get(teammateId) : null;
+      if (!teammate) return;
+      golem.guard = false;
+      teammate.guard = true;
+      log.push(`${runtime?.prefix ?? ""}护：移交给 ${teammate.name}`);
+      return;
+    }
+    if (effect.type === "golemRebirth") {
+      golemRebirthByPlayerId.add(sideCtx.my.playerId);
+      log.push(`${runtime?.prefix ?? ""}${effect.raw}`);
+      return;
+    }
+    if (effect.type === "block") {
+      return;
+    }
     if (effect.type === "attack") {
-      if (opponentBlockSuccess) return;
-      const base = computeAttackDamage(sideCtx, effect);
+      const base = computeAttackDamage(sideCtx, effect) + (effect.bonusMode === "soul" ? Number(runtime?.soulAtStart) || 0 : 0);
       const prefix = runtime?.prefix ?? "";
       const atkLabel = effect.flame ? "攻击焰" : "攻击";
+      if (runtime?.wasAttackedByPlayerId && typeof runtime.wasAttackedByPlayerId.set === "function") {
+        const mark = (targetId) => {
+          if (targetId && targetId === sideCtx.opp.mainId) runtime.wasAttackedByPlayerId.set(sideCtx.opp.playerId, true);
+        };
+        if (effect.defenderMode === "double") {
+          for (const tid of sideCtx.opp.bothIds ?? []) mark(tid);
+        } else if (effect.target === "enemySupport") {
+          mark(sideCtx.opp.supportId);
+        } else if (effect.target === "allySupport") {
+          mark(sideCtx.my.supportId);
+        } else {
+          mark(sideCtx.opp.mainId);
+        }
+      }
+      const oppBlockActive = runtime?.oppBlockActive === true;
+      const oppBlockInner = Array.isArray(runtime?.oppBlockInner) ? runtime.oppBlockInner : [];
+      if (oppBlockActive && oppBlockInner.length > 0) {
+        if (runtime && typeof runtime === "object") runtime.attackBlocked = true;
+        log.push(`${prefix}${runtime?.card?.fighterName ?? "?"} ${atkLabel}：被对方格挡`);
+        const defCtx = flipContext(sideCtx);
+        const defPlayerMap = runtime?.oppPlayerMap;
+        const defQueuePower = runtime?.oppQueuePower;
+        const defRuntime =
+          runtime && typeof runtime === "object"
+            ? {
+                ...runtime,
+                prefix: runtime.oppPrefix ?? "",
+                oppPrefix: runtime.prefix ?? "",
+                card: runtime.oppCard,
+                oppCard: runtime.card,
+                myEffects: runtime.oppEffects,
+                oppEffects: runtime.myEffects,
+                oppPlayerMap: playerMap,
+                oppQueuePower: queuePower,
+                oppCanceled: canceledSelf,
+              }
+            : null;
+        for (const inner of oppBlockInner) {
+          applyAtomicEffect(defCtx, inner, false, false, true, defPlayerMap, defQueuePower, defRuntime, linkId);
+        }
+        return;
+      }
+      if (runtime && typeof runtime === "object") runtime.attackBlocked = false;
+      const tryGuardBlock = (targetId, dmg) => {
+        if (!targetId) return false;
+        const guardAtStartById = runtime?.guardAtStartById;
+        if (guardAtStartById?.get?.(targetId) !== true) return false;
+        const target = fighterById.get(targetId);
+        if (!target) return false;
+        if (target.guard !== true) return false;
+        const pid = String(targetId).split(":")[0] || "";
+        const golem = [...fighterById.values()].find((x) => x?.name === "魔像" && String(x.id).startsWith(`${pid}:`));
+        if (!golem) return false;
+        if (golem.id === targetId) return false;
+        target.guard = false;
+        golem.guard = true;
+        if (runtime?.guardBlockedByPlayerId && typeof runtime.guardBlockedByPlayerId.add === "function") runtime.guardBlockedByPlayerId.add(pid);
+        log.push(`${prefix}护：${target.name} 抵挡攻击伤害 ${dmg}，护移动回魔像`);
+        return true;
+      };
       if (effect.defenderMode === "double") {
         const id1 = sideCtx.opp.bothIds[0];
         const id2 = sideCtx.opp.bothIds[1];
         const d1 = base + (effect.flame ? flameCountByOwner(fighterById.get(id1), sideCtx.my.playerId) : 0);
         const d2 = base + (effect.flame ? flameCountByOwner(fighterById.get(id2), sideCtx.my.playerId) : 0);
-        addHp(id1, -d1);
-        addHp(id2, -d2);
+        const b1 = tryGuardBlock(id1, d1);
+        const b2 = tryGuardBlock(id2, d2);
+        if (!b1) addHp(id1, -d1);
+        if (!b2) addHp(id2, -d2);
         const n1 = fighterById.get(sideCtx.opp.bothIds[0])?.name ?? sideCtx.opp.bothIds[0];
         const n2 = fighterById.get(sideCtx.opp.bothIds[1])?.name ?? sideCtx.opp.bothIds[1];
         const dmgText = d1 === d2 ? `${d1}` : `${d1}/${d2}`;
-        log.push(`${prefix}${runtime?.card?.fighterName ?? "?"} ${atkLabel}：对 ${n1}/${n2} 造成 ${dmgText}`);
+        log.push(`${prefix}${runtime?.card?.fighterName ?? "?"} ${atkLabel}：对 ${n1}/${n2} 造成 ${dmgText}${b1 || b2 ? "（部分被护抵挡）" : ""}`);
       } else if (effect.target === "enemySupport") {
         const id = sideCtx.opp.supportId;
         const dmg = base + (effect.flame ? flameCountByOwner(fighterById.get(id), sideCtx.my.playerId) : 0);
-        addHp(id, -dmg);
+        const blockedByGuard = tryGuardBlock(id, dmg);
+        if (!blockedByGuard) addHp(id, -dmg);
         const n = fighterById.get(sideCtx.opp.supportId)?.name ?? sideCtx.opp.supportId;
-        log.push(`${prefix}${runtime?.card?.fighterName ?? "?"} ${atkLabel}：对 ${n} 造成 ${dmg}`);
+        log.push(`${prefix}${runtime?.card?.fighterName ?? "?"} ${atkLabel}：对 ${n} 造成 ${dmg}${blockedByGuard ? "（被护抵挡）" : ""}`);
+      } else if (effect.target === "allySupport") {
+        const id = sideCtx.my.supportId;
+        const dmg = base + (effect.flame ? flameCountByOwner(fighterById.get(id), sideCtx.my.playerId) : 0);
+        const blockedByGuard = tryGuardBlock(id, dmg);
+        if (!blockedByGuard) addHp(id, -dmg);
+        const n = fighterById.get(id)?.name ?? id;
+        log.push(`${prefix}${runtime?.card?.fighterName ?? "?"} ${atkLabel}：对 ${n} 造成 ${dmg}${blockedByGuard ? "（被护抵挡）" : ""}`);
       } else {
         const id = sideCtx.opp.mainId;
         const dmg = base + (effect.flame ? flameCountByOwner(fighterById.get(id), sideCtx.my.playerId) : 0);
-        addHp(id, -dmg);
+        const blockedByGuard = tryGuardBlock(id, dmg);
+        if (!blockedByGuard) addHp(id, -dmg);
         const n = fighterById.get(sideCtx.opp.mainId)?.name ?? sideCtx.opp.mainId;
-        log.push(`${prefix}${runtime?.card?.fighterName ?? "?"} ${atkLabel}：对 ${n} 造成 ${dmg}`);
+        log.push(`${prefix}${runtime?.card?.fighterName ?? "?"} ${atkLabel}：对 ${n} 造成 ${dmg}${blockedByGuard ? "（被护抵挡）" : ""}`);
       }
       if (effect.inner.length) {
         for (const inner of effect.inner)
@@ -1343,6 +2108,7 @@ function settleEffects({
       let amount = 0;
       if (Number.isFinite(effect.amount)) amount = effect.amount;
       else if (effect.amountMode === "startPowerMain") amount = sideCtx.startPower.get(sideCtx.my.mainId) ?? 0;
+      else if (effect.amountMode === "soulMul") amount = (Number(effect.base) || 0) * (Number(runtime?.soulAtStart) || 0);
       else if (effect.amountMode === "blockedAttackStartPower") {
         const atkCtx = flipContext(sideCtx);
         const atkRuntime = runtime
@@ -1384,6 +2150,12 @@ function settleEffects({
       for (const id of ids) addHp(id, -effect.amount);
       return;
     }
+    if (effect.type === "directAll") {
+      const ids = [...(sideCtx.my.bothIds ?? []), ...(sideCtx.opp.bothIds ?? [])];
+      for (const id of ids) addHp(id, -(Number(effect.amount) || 0));
+      log.push(`${runtime?.prefix ?? ""}${effect.raw}`);
+      return;
+    }
     if (effect.type === "power") {
       const ids = targetToFighterIds(sideCtx, effect.target, playerMap);
       for (const id of ids) queuePower(id, effect.amount, linkId ?? null);
@@ -1401,6 +2173,8 @@ function settleEffects({
     blockSuccess,
     playerMap,
     attackingForBlock,
+    oppAttacking,
+    miladyWasAttacked,
     queuePower,
     runtime,
     deferredAfterOpp,
@@ -1409,15 +2183,20 @@ function settleEffects({
       log.push(`${prefix}${card.fighterName} 打出的卡被取消：效果不结算`);
       return;
     }
-    if (opponentBlockSuccess && attackingForBlock) {
-      log.push(`${prefix}${card.fighterName} 的攻击被对方格挡：本回合所有攻击词条失败`);
+    if (runtime && typeof runtime === "object") {
+      runtime.oppAttacking = oppAttacking === true;
+      runtime.formAtStart = fighterById.get(sideCtx.my.mainId)?.bodvarForm ?? null;
+      runtime.attackBlocked = false;
+      runtime.hpAt = hpAt;
+      runtime.miladyWasAttacked = miladyWasAttacked === true;
+      runtime.oppMainHadNing = ningCountByOwner(fighterById.get(sideCtx.opp.mainId), sideCtx.my.playerId) > 0;
+      const elf = [...fighterById.values()].find((x) => x?.name === "精灵族" && String(x.id).startsWith(`${sideCtx.my.playerId}:`));
+      runtime.soulAtStart = Number(elf?.elf?.soul) || 0;
     }
-    const hasBlock = effects.some((e) => e.type === "block");
-    if (hasBlock && blockSuccess) log.push(`${prefix}${card.fighterName} 格挡成功`);
-    if (hasBlock && !blockSuccess) log.push(`${prefix}${card.fighterName} 格挡失败`);
 
     for (const e of effects) {
       if (e.type === "onInsert") continue;
+      if (e.type === "block") continue;
       if (e.type === "afterOppExecuteLowHp") {
         deferredAfterOpp.push({ sideCtx, effect: e, prefix });
         continue;
@@ -1426,47 +2205,110 @@ function settleEffects({
     }
   }
 
-  applySide({
-    prefix: "P1: ",
-    sideCtx: ctx,
-    card: myCard,
-    effects: myEffects,
-    canceledSelf: p1Canceled,
-    opponentBlockSuccess: p2BlockSuccess,
-    blockSuccess: p1BlockSuccess,
-    playerMap: myPlayer.fightersByName,
-    attackingForBlock: p1Attacking,
-    queuePower: (id, amount, linkId) => {
-      powerOpsP1.push({ id, amount, linkId });
-    },
-    runtime: { myEffects, oppEffects, fighterById, prefix: "P1: ", card: myCard, oppCard, startPoliceOwnerPlayerId, startPoliceOwnerFighterId },
-    deferredAfterOpp: deferredAfterOppP1,
-  });
-  applySide({
-    prefix: "P2: ",
-    sideCtx: flipContext(ctx),
-    card: oppCard,
-    effects: oppEffects,
-    canceledSelf: p2Canceled,
-    opponentBlockSuccess: p1BlockSuccess,
-    blockSuccess: p2BlockSuccess,
-    playerMap: oppPlayer.fightersByName,
-    attackingForBlock: p2Attacking,
-    queuePower: (id, amount, linkId) => {
-      powerOpsP2.push({ id, amount, linkId });
-    },
-    runtime: {
-      myEffects: oppEffects,
-      oppEffects: myEffects,
-      fighterById,
+  if (applyP1) {
+    applySide({
+      prefix: "P1: ",
+      sideCtx: ctx,
+      card: myCard,
+      effects: myEffects,
+      canceledSelf: p1Canceled,
+      opponentBlockSuccess: p2BlockSuccess,
+      blockSuccess: p1BlockSuccess,
+      playerMap: myPlayer.fightersByName,
+      attackingForBlock: p1Attacking,
+      oppAttacking: p2Attacking,
+      miladyWasAttacked: p1MiladyWasAttacked,
+      queuePower: (id, amount, linkId) => {
+        powerOpsP1.push({ id, amount, linkId });
+      },
+      runtime: {
+        myEffects,
+        oppEffects,
+        fighterById,
+        prefix: "P1: ",
+        oppPrefix: "P2: ",
+        card: myCard,
+        oppCard,
+        oppPlayerMap: oppPlayer.fightersByName,
+        oppQueuePower: (id, amount, linkId) => {
+          powerOpsP2.push({ id, amount, linkId });
+        },
+        oppCanceled: p2Canceled,
+        startPoliceOwnerPlayerId,
+        startPoliceOwnerFighterId,
+        deferredAfterAll: deferredAfterAllP1,
+        guardAtStartById,
+        oppBlockActive: blockActiveByPlayerId.p2,
+        oppBlockInner: blockInnerByPlayerId.p2,
+        wasAttackedByPlayerId,
+        blockActiveByPlayerId,
+        blockInnerByPlayerId,
+        guardBlockedByPlayerId,
+        flipTriggeredByCardId,
+      },
+      deferredAfterOpp: deferredAfterOppP1,
+    });
+  }
+  if (applyP2) {
+    applySide({
       prefix: "P2: ",
+      sideCtx: flipContext(ctx),
       card: oppCard,
-      oppCard: myCard,
-      startPoliceOwnerPlayerId,
-      startPoliceOwnerFighterId,
-    },
-    deferredAfterOpp: deferredAfterOppP2,
-  });
+      effects: oppEffects,
+      canceledSelf: p2Canceled,
+      opponentBlockSuccess: p1BlockSuccess,
+      blockSuccess: p2BlockSuccess,
+      playerMap: oppPlayer.fightersByName,
+      attackingForBlock: p2Attacking,
+      oppAttacking: p1Attacking,
+      miladyWasAttacked: p2MiladyWasAttacked,
+      queuePower: (id, amount, linkId) => {
+        powerOpsP2.push({ id, amount, linkId });
+      },
+      runtime: {
+        myEffects: oppEffects,
+        oppEffects: myEffects,
+        fighterById,
+        prefix: "P2: ",
+        oppPrefix: "P1: ",
+        card: oppCard,
+        oppCard: myCard,
+        oppPlayerMap: myPlayer.fightersByName,
+        oppQueuePower: (id, amount, linkId) => {
+          powerOpsP1.push({ id, amount, linkId });
+        },
+        oppCanceled: p1Canceled,
+        startPoliceOwnerPlayerId,
+        startPoliceOwnerFighterId,
+        deferredAfterAll: deferredAfterAllP2,
+        guardAtStartById,
+        oppBlockActive: blockActiveByPlayerId.p1,
+        oppBlockInner: blockInnerByPlayerId.p1,
+        wasAttackedByPlayerId,
+        blockActiveByPlayerId,
+        blockInnerByPlayerId,
+        guardBlockedByPlayerId,
+        flipTriggeredByCardId,
+      },
+      deferredAfterOpp: deferredAfterOppP2,
+    });
+  }
+
+  function runDeferredAfterAll(queue) {
+    if (!Array.isArray(queue) || queue.length === 0) return;
+    let i = 0;
+    while (i < queue.length) {
+      const item = queue[i++];
+      if (!item) continue;
+      const effects = item.effects ?? [];
+      for (const e of effects) {
+        applyAtomicEffect(item.sideCtx, e, item.canceledSelf, item.opponentBlockSuccess, item.blockSuccess, item.playerMap, item.queuePower, item.runtime, item.linkId ?? null);
+      }
+    }
+  }
+
+  runDeferredAfterAll(deferredAfterAllP1);
+  runDeferredAfterAll(deferredAfterAllP2);
 
   function applyPowerOpsWithTransfer(ops) {
     const remaining = new Map();
@@ -1510,11 +2352,6 @@ function settleEffects({
   applyPowerOpsWithTransfer(powerOpsP1);
   applyPowerOpsWithTransfer(powerOpsP2);
 
-  const hpAt = (id) => {
-    const base = fighterById.get(id)?.hp ?? 0;
-    return base + (hpDelta.get(id) ?? 0);
-  };
-
   function runDeferredAfterOpp(item) {
     const { sideCtx, effect, prefix } = item;
     const threshold = Number(effect.threshold) || 0;
@@ -1533,10 +2370,30 @@ function settleEffects({
   for (const item of deferredAfterOppP1) runDeferredAfterOpp(item);
   for (const item of deferredAfterOppP2) runDeferredAfterOpp(item);
 
+  for (const item of poisonQueue) {
+    const targetId = item?.sideCtx?.opp?.mainId;
+    if (!targetId) continue;
+    const hpNow = hpAt(targetId);
+    if (!(hpNow > 0)) continue;
+    const dmg = Math.max(0, Math.floor(hpNow / 2));
+    if (!dmg) continue;
+    addHp(targetId, -dmg);
+    const name = fighterById.get(targetId)?.name ?? targetId;
+    log.push(`${item.prefix ?? ""}毒：对 ${name} 造成 ${dmg}`);
+  }
+
   return {
     log,
     hpDelta,
     powerDelta,
+    planEvents,
+    removeBothCardsFromGame,
+    flameKoByPlayerId,
+    golemRebirthByPlayerId,
+    guardBlockedByPlayerId,
+    flipTriggeredByCardId,
+    blockActiveByPlayerId,
+    blockInnerByPlayerId,
     myCanceled: p1Canceled,
     oppCanceled: p2Canceled,
     myBlockSuccess: p1BlockSuccess,
@@ -1545,10 +2402,59 @@ function settleEffects({
   };
 }
 
-function applyDeltas(state, hpDelta, powerDelta) {
+function applyDeltas(state, hpDelta, powerDelta, startSnapshot, guardAtStartById, blockActiveByPlayerId, blockInnerByPlayerId) {
   const fighters = [...state.players.p1.fighters, ...state.players.p2.fighters];
   const fighterById = new Map(fighters.map((f) => [f.id, f]));
   const hpTraceById = new Map();
+  const p1 = state.players.p1;
+  const p2 = state.players.p2;
+  const startPowerById = new Map();
+  const planEvents = [];
+  const extraLog = [];
+  const guardBlockedByPlayerId = new Set();
+  const wasAttackedByPlayerId = new Map([
+    ["p1", false],
+    ["p2", false],
+  ]);
+  const playerMapByPlayerId = { p1: p1.fightersByName, p2: p2.fightersByName };
+  for (const f of fighters) {
+    const v = startSnapshot?.get?.(f.id)?.power;
+    startPowerById.set(f.id, Number.isFinite(v) ? Number(v) : Number(f.power) || 0);
+  }
+
+  function buildStateCtx(ownerPid) {
+    const myPlayer = ownerPid === "p1" ? p1 : p2;
+    const oppPid = ownerPid === "p1" ? "p2" : "p1";
+    const oppPlayer = ownerPid === "p1" ? p2 : p1;
+    let myMain = myPlayer.fighters[0];
+    let mySupport = myPlayer.fighters[1];
+    let oppMain = oppPlayer.fighters[0];
+    let oppSupport = oppPlayer.fighters[1];
+    const lf = state.lastFlip;
+    if (lf?.p1Card && lf?.p2Card) {
+      const myCard = ownerPid === "p1" ? lf.p1Card : lf.p2Card;
+      const oppCard = ownerPid === "p1" ? lf.p2Card : lf.p1Card;
+      const mm = myPlayer.fighters.find((x) => x.name === myCard.fighterName);
+      const om = oppPlayer.fighters.find((x) => x.name === oppCard.fighterName);
+      if (mm) myMain = mm;
+      if (om) oppMain = om;
+      const ms = myPlayer.fighters.find((x) => x.id !== myMain.id);
+      const os = oppPlayer.fighters.find((x) => x.id !== oppMain.id);
+      if (ms) mySupport = ms;
+      if (os) oppSupport = os;
+    }
+    const startPower = new Map();
+    for (const f of myPlayer.fighters) startPower.set(f.id, startPowerById.get(f.id) ?? (Number(f.power) || 0));
+    for (const f of oppPlayer.fighters) startPower.set(f.id, startPowerById.get(f.id) ?? (Number(f.power) || 0));
+    return {
+      kind: "state",
+      my: { playerId: ownerPid, mainId: myMain?.id, supportId: mySupport?.id, bothIds: [myMain?.id, mySupport?.id].filter(Boolean) },
+      opp: { playerId: oppPid, mainId: oppMain?.id, supportId: oppSupport?.id, bothIds: [oppMain?.id, oppSupport?.id].filter(Boolean) },
+      startPower,
+      myPlayer,
+      oppPlayer,
+    };
+  }
 
   for (const [id, d] of powerDelta.entries()) {
     const f = fighterById.get(id);
@@ -1559,6 +2465,7 @@ function applyDeltas(state, hpDelta, powerDelta) {
   function stepHpChange(f, d0, trace) {
     let remaining = Number(d0) || 0;
     if (!remaining) return;
+    if (f?.name === "精灵族" && f?.elf && f.elf.active == null) return;
     const dir = remaining > 0 ? 1 : -1;
     remaining = Math.abs(remaining);
     let stop = false;
@@ -1575,39 +2482,184 @@ function applyDeltas(state, hpDelta, powerDelta) {
           stop = true;
         } else {
           const hpRuleEffects = triggered.effects ?? [];
-          const walk = (e) => {
+          const ownerPid = String(f.id).startsWith("p2:") ? "p2" : "p1";
+          const sc = buildStateCtx(ownerPid);
+          const ctx = sc.kind === "state" ? { kind: "state", my: sc.my, opp: sc.opp, startPower: sc.startPower } : sc;
+          const playerMap = sc.myPlayer.fightersByName;
+          const poisonQueue = [];
+          const runtime = {
+            fighterById,
+            hpAt: (id) => fighterById.get(id)?.hp ?? 0,
+            oppAttacking: false,
+            attackBlocked: false,
+            formAtStart: fighterById.get(ctx.my.mainId)?.bodvarForm ?? null,
+            guardAtStartById,
+            wasAttackedByPlayerId,
+            blockActiveByPlayerId,
+            blockInnerByPlayerId,
+            playerMapByPlayerId,
+          };
+          const applyOneWith = (e, localCtx, localPlayerMap) => {
             if (!e) return;
             if (e.type === "linked") {
-              for (const x of e.inner) walk(x);
+              for (const x of e.inner ?? []) applyOneWith(x, localCtx, localPlayerMap);
               return;
             }
-            if (e.type === "conditional") return;
+            if (e.type === "conditional") {
+              if (condOk(e, localCtx, runtime)) for (const x of e.inner ?? []) applyOneWith(x, localCtx, localPlayerMap);
+              return;
+            }
+            if (e.type === "poison") {
+              poisonQueue.push({ ctx: { ...localCtx }, raw: e.raw });
+              return;
+            }
+            if (e.type === "planDraft" || e.type === "planExecute") {
+              const miladyRef = localPlayerMap.get("米莱狄");
+              const milady = miladyRef ? fighterById.get(miladyRef.id) : null;
+              if (!milady || !milady.plan || !Array.isArray(milady.planTexts)) return;
+              const plan = milady.plan;
+              if (e.type === "planDraft") {
+                if (!Array.isArray(plan.available) || plan.available.length === 0) return;
+                const idx = Math.floor(Math.random() * plan.available.length);
+                const no = plan.available.splice(idx, 1)[0];
+                plan.ready.push(no);
+                planEvents.push({ playerId: localCtx.my.playerId, source: "hpRule", triggerId: f.id, triggerHp: f.hp, kind: "draft", planNo: no, planText: String(milady.planTexts[no - 1] ?? ""), result: "ok" });
+                return;
+              }
+              if (!Array.isArray(plan.ready) || plan.ready.length === 0) {
+                planEvents.push({ playerId: localCtx.my.playerId, source: "hpRule", triggerId: f.id, triggerHp: f.hp, kind: "execute", planNo: null, planText: "", result: "empty" });
+                return;
+              }
+              const idx = Math.floor(Math.random() * plan.ready.length);
+              const no = plan.ready.splice(idx, 1)[0];
+              plan.discard.push(no);
+              const text = String(milady.planTexts[no - 1] ?? "").trim();
+              planEvents.push({ playerId: localCtx.my.playerId, source: "hpRule", triggerId: f.id, triggerHp: f.hp, kind: "execute", planNo: no, planText: text, result: "ok" });
+              const planEffects = text ? parseCardEffects(text) : [];
+              for (const pe of planEffects) applyOneWith(pe, localCtx, localPlayerMap);
+              return;
+            }
             if (e.type === "power") {
-              f.power = Math.max(0, (Number(f.power) || 0) + (Number(e.amount) || 0));
+              const ids = targetToFighterIds(localCtx, e.target, localPlayerMap);
+              for (const id of ids) {
+                const t = fighterById.get(id);
+                if (t) t.power = Math.max(0, (Number(t.power) || 0) + (Number(e.amount) || 0));
+              }
               return;
             }
             if (e.type === "heal") {
-              stepHpChange(f, Number(e.amount) || 0, trace);
+              let amount = 0;
+              if (Number.isFinite(e.amount)) amount = Number(e.amount) || 0;
+              else if (e.amountMode === "startPowerMain") amount = localCtx.startPower.get(localCtx.my.mainId) ?? 0;
+              const ids = targetToFighterIds(localCtx, e.target, localPlayerMap);
+              for (const id of ids) {
+                const t = fighterById.get(id);
+                if (t) stepHpChange(t, amount, id === f.id ? trace : null);
+              }
               return;
             }
             if (e.type === "direct") {
-              stepHpChange(f, -(Number(e.amount) || 0), trace);
+              const ids = targetToFighterIds(localCtx, e.target, localPlayerMap);
+              for (const id of ids) {
+                const t = fighterById.get(id);
+                if (t) stepHpChange(t, -(Number(e.amount) || 0), id === f.id ? trace : null);
+              }
+              return;
+            }
+            if (e.type === "directAll") {
+              const ids = [...(localCtx.my.bothIds ?? []), ...(localCtx.opp.bothIds ?? [])];
+              for (const id of ids) {
+                const t = fighterById.get(id);
+                if (t) stepHpChange(t, -(Number(e.amount) || 0), id === f.id ? trace : null);
+              }
+              return;
+            }
+            if (e.type === "attack") {
+              const dmg =
+                e.attackerMode === "double"
+                  ? (localCtx.startPower.get(localCtx.my.bothIds?.[0]) ?? 0) + (localCtx.startPower.get(localCtx.my.bothIds?.[1]) ?? 0)
+                  : e.attackerMode === "support"
+                    ? (localCtx.startPower.get(localCtx.my.supportId) ?? 0)
+                    : (localCtx.startPower.get(localCtx.my.mainId) ?? 0);
+              if (runtime?.wasAttackedByPlayerId && typeof runtime.wasAttackedByPlayerId.set === "function") {
+                const mark = (targetId) => {
+                  if (targetId && targetId === localCtx.opp.mainId) runtime.wasAttackedByPlayerId.set(localCtx.opp.playerId, true);
+                };
+                if (e.defenderMode === "double") {
+                  for (const tid of localCtx.opp.bothIds ?? []) mark(tid);
+                } else if (e.target === "enemySupport") {
+                  mark(localCtx.opp.supportId);
+                } else if (e.target === "allySupport") {
+                  mark(localCtx.my.supportId);
+                } else {
+                  mark(localCtx.opp.mainId);
+                }
+              }
+              const defenderPid = e.target === "allySupport" ? localCtx.my.playerId : localCtx.opp.playerId;
+              const blockOk = blockActiveByPlayerId && blockActiveByPlayerId[defenderPid] === true;
+              const blockInner = blockInnerByPlayerId && Array.isArray(blockInnerByPlayerId[defenderPid]) ? blockInnerByPlayerId[defenderPid] : [];
+              if (blockOk && blockInner.length > 0) {
+                runtime.attackBlocked = true;
+                extraLog.push(`${defenderPid.toUpperCase()}: 格挡成功`);
+                const defCtx = flipContext(localCtx);
+                const defMap = playerMapByPlayerId[defenderPid];
+                for (const inner of blockInner) applyOneWith(inner, defCtx, defMap);
+                return;
+              }
+              runtime.attackBlocked = false;
+              const applyAtk = (id, dmg) => {
+                const t = fighterById.get(id);
+                if (!t) return;
+                if (guardAtStartById?.get?.(id) === true && t.guard === true) {
+                  const pid = String(id).split(":")[0] || "";
+                  const golem = [...fighterById.values()].find((x) => x?.name === "魔像" && String(x.id).startsWith(`${pid}:`));
+                  if (golem && golem.id !== id) {
+                    t.guard = false;
+                    golem.guard = true;
+                    guardBlockedByPlayerId.add(pid);
+                    extraLog.push(`护：${t.name} 抵挡攻击伤害 ${dmg}，护移动回魔像`);
+                    return;
+                  }
+                }
+                stepHpChange(t, -dmg, id === f.id ? trace : null);
+              };
+              if (e.defenderMode === "double") {
+                for (const id of localCtx.opp.bothIds ?? []) applyAtk(id, dmg);
+                return;
+              }
+              if (e.target === "enemySupport") applyAtk(localCtx.opp.supportId, dmg);
+              else if (e.target === "allySupport") applyAtk(localCtx.my.supportId, dmg);
+              else applyAtk(localCtx.opp.mainId, dmg);
               return;
             }
             if (e.type === "snakeFlip") {
-              const beforeSnake = Number(f.snake) || 0;
+              const t = fighterById.get(localCtx.my.mainId);
+              if (!t) return;
+              const beforeSnake = Number(t.snake) || 0;
               const nextSnake = beforeSnake === 1 ? 0 : 1;
-              f.snake = nextSnake;
-              if (Array.isArray(f.snakeFlipMark)) {
-                const last = f.snakeFlipMark[f.snakeFlipMark.length - 1];
-                if (last !== beforeSnake) f.snakeFlipMark.push(beforeSnake);
-                f.snakeFlipMark.push(nextSnake);
+              t.snake = nextSnake;
+              if (Array.isArray(t.snakeFlipMark)) {
+                const last = t.snakeFlipMark[t.snakeFlipMark.length - 1];
+                if (last !== beforeSnake) t.snakeFlipMark.push(beforeSnake);
+                t.snakeFlipMark.push(nextSnake);
               } else {
-                f.snakeFlipMark = [beforeSnake, nextSnake];
+                t.snakeFlipMark = [beforeSnake, nextSnake];
               }
             }
           };
-          for (const e of hpRuleEffects) walk(e);
+          const applyOne = (e) => applyOneWith(e, ctx, playerMap);
+          for (const e of hpRuleEffects) applyOne(e);
+          for (const p of poisonQueue) {
+            const targetId = p?.ctx?.opp?.mainId;
+            if (!targetId) continue;
+            const t = fighterById.get(targetId);
+            if (!t) continue;
+            const hpNow = Number(t.hp) || 0;
+            if (!(hpNow > 0)) continue;
+            const dmg = Math.max(0, Math.floor(hpNow / 2));
+            if (!dmg) continue;
+            stepHpChange(t, -dmg, targetId === f.id ? trace : null);
+          }
         }
       }
 
@@ -1629,7 +2681,7 @@ function applyDeltas(state, hpDelta, powerDelta) {
     stepHpChange(f, d0, trace);
     if (trace.length >= 2) hpTraceById.set(id, trace);
   }
-  return hpTraceById;
+  return { hpTraceById, planEvents, log: extraLog, guardBlockedByPlayerId };
 }
 
 function snapshotFightersState(state) {
@@ -1640,7 +2692,11 @@ function snapshotFightersState(state) {
 }
 
 function checkWinner(state) {
-  const isKoNow = (f) => (Array.isArray(f.koLines) && f.koLines.length > 0 ? f.koLines.includes(Number(f.hp) || 0) : Number(f.hp) <= Number(f.koLine));
+  const isKoNow = (f) => {
+    if (f?.koByFlame === true) return true;
+    if (f?.name === "精灵族") return f?.elf?.gameKo === true;
+    return Array.isArray(f.koLines) && f.koLines.length > 0 ? f.koLines.includes(Number(f.hp) || 0) : Number(f.hp) <= Number(f.koLine);
+  };
   const p1KO = state.players.p1.fighters.some(isKoNow);
   const p2KO = state.players.p2.fighters.some(isKoNow);
   if (p1KO && p2KO) return "draw";
@@ -1706,7 +2762,7 @@ function resolveOnInsert(state, playerId, insertedCard, pushLog) {
   });
   for (const line of settlement.log) pushLog(`[入库时][${playerId.toUpperCase()}] ${line}`);
   const beforeSnapshot = snapshotFightersState(state);
-  applyDeltas(state, settlement.hpDelta, settlement.powerDelta);
+  applyDeltas(state, settlement.hpDelta, settlement.powerDelta, beforeSnapshot, null, null, null);
   const afterSnapshot = snapshotFightersState(state);
   const allFighters = [...player.fighters, ...opponent.fighters];
   const fighterById = new Map(allFighters.map((f) => [f.id, f]));
@@ -1797,6 +2853,7 @@ function createApp() {
 
   let state = { phase: PHASE.LOADING };
   let renderQueued = false;
+  let activeInsertDrag = null;
 
   function scheduleRender() {
     if (renderQueued) return;
@@ -1821,7 +2878,11 @@ function createApp() {
     if (state.phase === PHASE.BATTLE) return `战斗轮次 ${state.round} · 回合 ${state.turn}`;
     if (state.phase === PHASE.CONSTRUCTION) return `构筑阶段`;
     if (state.phase === PHASE.GAME_OVER) {
-      const isKoNow = (f) => (Array.isArray(f.koLines) && f.koLines.length > 0 ? f.koLines.includes(Number(f.hp) || 0) : Number(f.hp) <= Number(f.koLine));
+      const isKoNow = (f) => {
+        if (f?.koByFlame === true) return true;
+        if (f?.name === "精灵族") return f?.elf?.gameKo === true;
+        return Array.isArray(f.koLines) && f.koLines.length > 0 ? f.koLines.includes(Number(f.hp) || 0) : Number(f.hp) <= Number(f.koLine);
+      };
       const p1KO = state.players?.p1?.fighters?.some(isKoNow) === true;
       const p2KO = state.players?.p2?.fighters?.some(isKoNow) === true;
       const resLine =
@@ -1842,6 +2903,23 @@ function createApp() {
       .replaceAll("'", "&#39;");
   }
 
+  function headshotKey(name) {
+    const n = String(name ?? "");
+    if (n === "玛曼布丽吉特") return "玛曼";
+    return n;
+  }
+
+  function headshotUrl(name) {
+    const key = headshotKey(name);
+    return `headshots/${encodeURIComponent(key)}.png`;
+  }
+
+  function headshotImgHtml(name, className) {
+    const url = headshotUrl(name);
+    const cls = className ? String(className) : "headshot";
+    return `<img class="${escapeHtml(cls)}" src="${escapeHtml(url)}" alt="${escapeHtml(name)}" loading="lazy" onerror="this.style.display='none'">`;
+  }
+
   function cardLabel(card) {
     if (!card) return "-";
     const n = card.cardName ? String(card.cardName).trim() : "";
@@ -1850,11 +2928,30 @@ function createApp() {
 
   function displayCardText(card) {
     if (!card) return "-";
+    const showFlipHint =
+      state?.phase === PHASE.BATTLE &&
+      state?.lastRound?.round === state?.round &&
+      state?.lastRound?.turn === state?.turn &&
+      state?.lastRound?.flipTriggeredByCardId?.has?.(card.id) === true;
     if (card.fighterName === "郑一嫂" && Number(card.cardNo) === 1)
-      return "船0~7攻击；8~15回复2；20群伤至1；战船+1";
+      return `船0~7攻击；8~15回复2；20群伤至1；战船+1${showFlipHint ? "（触发翻转）" : ""}`;
     if (card.fighterName === "派克帮" && Number(card.cardNo) === 1)
-      return "警在己方：攻击&交警；警在对方：获得警&力量同时+1";
-    return card.text || "-";
+      return `警在己方：攻击&交警；警在对方：获得警&力量同时+1${showFlipHint ? "（触发翻转）" : ""}`;
+    const t = card.text || "";
+    let shownFlipped = card.flipped === true;
+    const lf = state?.lastFlip;
+    if (lf?.p1Card?.id && lf.p1Card.id === card.id) shownFlipped = lf.p1FlippedAtStart === true;
+    else if (lf?.p2Card?.id && lf.p2Card.id === card.id) shownFlipped = lf.p2FlippedAtStart === true;
+    const idx = t.indexOf("//");
+    if (idx >= 0) {
+      const before = t.slice(0, idx).trim();
+      const after = t.slice(idx + 2).trim();
+      if (after) {
+        const base = shownFlipped === true ? `${after} // ${before}` : `${before} // ${after}`;
+        return `${base}${showFlipHint ? "（触发翻转）" : ""}`;
+      }
+    }
+    return `${t || "-"}${showFlipHint ? "（触发翻转）" : ""}`;
   }
 
   function cardTitleHtml(card) {
@@ -1870,7 +2967,7 @@ function createApp() {
     return m;
   }
 
-  function renderHpGrid(f, overlay) {
+  function renderHpGrid(f, overlay, opts) {
     const rulesByHp = new Map((f.hpRules ?? []).map((r) => [r.hp, r.effect]));
     const maxHp = Math.max(1, Number(f.maxHp) || 1);
     const hp = Number(f.hp) || 0;
@@ -1893,20 +2990,17 @@ function createApp() {
       const clamped = Math.max(1, Math.min(maxHp, v));
       return extraHead + clamped;
     };
-    const currentIdx = Math.max(1, Math.min(maxIdx, idxForHp(hp)));
+    const slots = Math.max(1, Math.min(30, Number(opts?.cells) || 30));
+    const maxIdx2 = Math.min(slots, maxHp + extraHead);
+    const currentIdx = Math.max(1, Math.min(maxIdx2, idxForHp(hp)));
     const oldIdxRaw = overlay?.oldHp ?? null;
     const oldIdx =
-      oldIdxRaw == null ? null : Math.max(1, Math.min(maxIdx, idxForHp(Number(oldIdxRaw))));
+      oldIdxRaw == null ? null : Math.max(1, Math.min(maxIdx2, idxForHp(Number(oldIdxRaw))));
     const hpDelta = Number(overlay?.hpDelta) || 0;
     const hpPath = Array.isArray(overlay?.hpPath) ? overlay.hpPath : null;
-    const hasPath = Boolean(hpPath && hpPath.length >= 2);
-    const showHpDelta =
-      Boolean(overlay?.showHpDelta) &&
-      oldIdx != null &&
-      ((oldIdx !== currentIdx && (hpDelta !== 0 || hasPath)) || (hasPath && hpPath.includes(-2)));
-    const hpMoveLabel = showHpDelta ? (hpPath && hpPath.length >= 2 ? hpPath.join("→") : `${hpDelta > 0 ? "→" : "←"}${Math.abs(hpDelta)}`) : "";
+    const showHpDelta = Boolean(overlay?.showHpDelta) && hpDelta !== 0 && oldIdx != null && oldIdx !== currentIdx;
+    const hpMoveLabel = showHpDelta ? `${hpDelta > 0 ? "→" : "←"}${Math.abs(hpDelta)}` : "";
     let cells = "";
-    const slots = 30;
     for (let i = 1; i <= slots; i++) {
       const enabled = i <= maxHp + extraHead;
       const isCurrent = enabled && i === currentIdx;
@@ -1943,10 +3037,19 @@ function createApp() {
         jumpHtml = `<div class="hp-jump hp-jump-left" data-from="${fromVal}" data-to="bonus"></div><div class="hp-jump hp-jump-right" data-from="bonus" data-to="4"></div>`;
       }
     }
+    if (opts?.compact === true) {
+      return `
+        <div class="hp-grid elf-compact" style="--hp-cells:${slots}">
+          ${cells}
+          ${arrowHtml}
+          ${jumpHtml}
+        </div>
+      `;
+    }
     return `
       <div class="hp-wrap">
         <div class="hp-label">HP</div>
-        <div class="hp-grid" style="--hp-cells:30">
+        <div class="hp-grid" style="--hp-cells:${slots}">
           ${cells}
           ${arrowHtml}
           ${jumpHtml}
@@ -1956,9 +3059,119 @@ function createApp() {
     `;
   }
 
+  function renderElfHpGrid(f, shownHp, overlay) {
+    const spirits = Array.isArray(f?.elf?.spirits) ? f.elf.spirits : [];
+    const dead = Array.isArray(f?.elf?.dead) ? f.elf.dead : [false, false, false];
+    const active = Number.isFinite(f?.elf?.active) ? Number(f.elf.active) : null;
+    const activeSpirit = active == null ? null : spirits[active] ?? null;
+    const activeMax = Math.max(0, Number(activeSpirit?.maxHp) || 0);
+    const hpNow = Math.max(0, Math.min(activeMax, Number(shownHp) || 0));
+    const slots = 30;
+    let cells = "";
+    for (let col = 1; col <= slots; col++) {
+      if (col > 18) {
+        cells += `<div class="hp-cell disabled" data-hp=""></div>`;
+        continue;
+      }
+      const g = Math.floor((col - 1) / 6);
+      const pos = ((col - 1) % 6) + 1;
+      const sp = spirits[g] ?? null;
+      const spMax = Math.max(0, Number(sp?.maxHp) || 0);
+      const isDead = dead[g] === true;
+      const isActive = active === g;
+      const tag = isDead ? "elf-dead" : isActive ? "elf-active" : "elf-idle";
+      const rulesByHp = new Map((sp?.hpRules ?? []).map((r) => [r.hp, r.effect]));
+
+      if (pos === 1) {
+        const isCurrent = isActive && hpNow <= 0;
+        cells += `
+          <div class="hp-cell ${tag}${isCurrent ? " current" : ""}" data-hp="0">
+            <div class="hp-ko">KO</div>
+            ${isCurrent ? `<div class="hp-cur">HP</div>` : ""}
+          </div>
+        `;
+        continue;
+      }
+
+      const hpIndex = pos - 1;
+      if (hpIndex > spMax) {
+        cells += `<div class="hp-cell placeholder ${tag}" data-hp=""></div>`;
+        continue;
+      }
+      const hpVal = isDead ? 0 : isActive ? hpNow : spMax;
+      const filled = hpIndex <= hpVal;
+      const isCurrent = isActive && hpVal > 0 && hpIndex === hpVal;
+      const ruleRaw = rulesByHp.get(hpIndex) ?? null;
+      const rule = ruleRaw ? String(ruleRaw).replaceAll("力量", "力") : null;
+      const oldIdxRaw = overlay?.oldHp ?? null;
+      const oldHp = isActive && oldIdxRaw != null ? Math.max(0, Math.min(activeMax, Number(oldIdxRaw) || 0)) : null;
+      const isOld = isActive && oldHp != null && hpIndex === oldHp && Number(overlay?.hpDelta) !== 0 && oldHp !== hpNow;
+      const hpDelta = isActive ? Number(overlay?.hpDelta) || 0 : 0;
+      const hpMoveLabel = isOld ? `${hpDelta > 0 ? "→" : "←"}${Math.abs(hpDelta)}` : "";
+      const classes = `hp-cell ${tag}${filled ? " filled" : ""}${isCurrent ? " current" : ""}${isOld ? " old" : ""}`;
+      cells += `
+        <div class="${classes}" data-hp="${hpIndex}">
+          ${isCurrent ? `<div class="hp-cur">HP</div>` : ""}
+          ${isOld ? `<div class="hp-move ${hpDelta > 0 ? "hp-move-up" : "hp-move-down"}">${hpMoveLabel}</div>` : ""}
+          ${rule ? `<div class="hp-rule">${escapeHtml(rule)}</div>` : ""}
+        </div>
+      `;
+    }
+    return `
+      <div class="hp-wrap">
+        <div class="hp-label">HP</div>
+        <div class="hp-grid" style="--hp-cells:${slots}">
+          ${cells}
+        </div>
+        <div class="hp-num">${active == null ? "-" : `${hpNow}/${activeMax}`}</div>
+      </div>
+    `;
+  }
+
+  function renderPowerGrid(f, overlay) {
+    const slots = 30;
+    const powerRaw = Number(f?.power) || 0;
+    const power = Math.max(0, powerRaw);
+    const filledCount = Math.min(slots, power);
+    const over = power > slots;
+
+    const oldPowerRaw = overlay?.oldPower ?? null;
+    const oldPower = oldPowerRaw == null ? null : Math.max(0, Number(oldPowerRaw) || 0);
+    const powerDelta = Number(overlay?.powerDelta) || 0;
+    const showPowerDelta =
+      Boolean(overlay?.showPowerDelta) && powerDelta !== 0 && oldPower != null && oldPower !== power;
+    const oldIdx = showPowerDelta ? Math.max(1, Math.min(slots, Math.max(1, oldPower))) : null;
+    const moveLabel = showPowerDelta ? `${powerDelta > 0 ? "→" : "←"}${Math.abs(powerDelta)}` : "";
+
+    let cells = "";
+    for (let i = 1; i <= slots; i++) {
+      const filled = i <= filledCount;
+      const isOld = showPowerDelta && i === oldIdx;
+      const classes = `power-cell${filled ? " filled" : ""}${isOld ? " old" : ""}`;
+      cells += `
+        <div class="${classes}" data-power="${i}">
+          ${isOld ? `<div class="power-move ${powerDelta > 0 ? "power-move-up" : "power-move-down"}">${moveLabel}</div>` : ""}
+        </div>
+      `;
+    }
+
+    return `
+      <div class="power-wrap">
+        <div class="power-label">力</div>
+        <div class="power-grid" style="--hp-cells:${slots}">
+          ${cells}
+          ${over ? `<div class="power-plus">+</div>` : ""}
+        </div>
+        <div class="power-num">${power}</div>
+      </div>
+    `;
+  }
+
   function renderFighter(f, opts) {
     const isMain = opts?.isMain === true;
     function isKoNow(fx) {
+      if (fx?.koByFlame === true) return true;
+      if (fx?.name === "精灵族") return fx?.elf?.gameKo === true;
       if (Array.isArray(fx.koLines) && fx.koLines.length > 0) {
         return fx.koLines.includes(Number(fx.hp) || 0);
       }
@@ -1974,6 +3187,25 @@ function createApp() {
       return Math.max(0, Math.min(5, sum));
     })();
     const flameMark = flameTotal > 0 ? `<div class="flame-mark">焰${flameTotal}</div>` : "";
+    const ningTotal = (() => {
+      const v = f?.ning;
+      if (!v || typeof v !== "object") return 0;
+      let sum = 0;
+      for (const x of Object.values(v)) sum += Number(x) || 0;
+      return Math.max(0, Math.min(2, sum));
+    })();
+    const ningMark = ningTotal > 0 ? `<div class="ning-mark">凝${ningTotal}</div>` : "";
+    const guardMark = f.guard === true ? `<div class="guard-mark">护</div>` : "";
+    const pidForMark = String(f?.id ?? "").split(":")[0];
+    const golemBlockMark =
+      f?.name === "魔像" &&
+      state?.phase === PHASE.BATTLE &&
+      state?.lastRound?.round === state?.round &&
+      state?.lastRound?.turn === state?.turn &&
+      state?.lastRound?.guardBlockedByPlayerId?.has?.(pidForMark) === true
+        ? `<div class="golem-block-mark">魔像抵挡！</div>`
+        : "";
+    const headshot = headshotImgHtml(f.name, "fighter-headshot");
     const rev = Math.max(0, Math.min(4, Number(f.revelation) || 0));
     const revBar =
       f.name === "贞德"
@@ -2004,18 +3236,48 @@ function createApp() {
           </div>
         `
         : "";
-    const snakeIsBlack = (Number(f.snake) || 0) === 1;
-    const snakeFlipMark = f?.snakeFlipMark ?? null;
-    const snakeMarkText =
-      Array.isArray(snakeFlipMark) && snakeFlipMark.length >= 2
-        ? snakeFlipMark.map((v) => (Number(v) === 1 ? "黑" : "白")).join("→")
+    const rage = Math.max(0, Math.min(7, Number(f.rage) || 0));
+    let rageCells = "";
+    for (let i = 1; i <= 7; i++) {
+      rageCells += `<div class="rage-cell${i <= rage ? " filled" : ""}${rage > 0 && i === rage ? " current" : ""}"></div>`;
+    }
+    const formLabel = f.bodvarForm === "bear" ? "熊" : "人";
+    const rageBar =
+      f.name === "博德瓦尔"
+        ? `
+          <div class="rage-wrap">
+            <div class="rage-label">怒</div>
+            <div class="rage-grid">${rageCells}</div>
+            <div class="rage-num">${formLabel} ${rage}/7</div>
+          </div>
+        `
         : "";
+    const planState = f?.plan;
+    const planBar =
+      f.name === "米莱狄" && planState
+        ? `
+          <div class="plan-wrap">
+            <div class="plan-label">计划</div>
+            <div class="plan-num">未${(planState.available ?? []).length} 已${(planState.ready ?? []).length} 弃${(planState.discard ?? []).length}</div>
+          </div>
+        `
+        : "";
+    const snakeFlipMark = f?.snakeFlipMark ?? null;
+    const snakeSeq = (() => {
+      const cur = (Number(f.snake) || 0) === 1 ? 1 : 0;
+      const base = Array.isArray(snakeFlipMark) && snakeFlipMark.length > 0 ? snakeFlipMark.map((v) => ((Number(v) || 0) === 1 ? 1 : 0)) : [cur];
+      if (base[base.length - 1] !== cur) base.push(cur);
+      return base;
+    })();
+    const snakeChainHtml = snakeSeq
+      .map((v) => `<span class="snake-chip ${v === 1 ? "black" : "white"}"></span>`)
+      .join(`<span class="snake-arrow">→</span>`);
     const snakeBar =
       f.name === "靡菲斯特"
         ? `
           <div class="snake-wrap">
             <div class="snake-label">蛇</div>
-            <div class="snake-cell${snakeIsBlack ? " black" : " white"}">${snakeMarkText}</div>
+            <div class="snake-cell"><div class="snake-chain">${snakeChainHtml}</div></div>
           </div>
         `
         : "";
@@ -2025,8 +3287,36 @@ function createApp() {
     const shownHp = base ? base.hp : f.hp;
     const shownPower = base ? base.power : f.power;
     const pText = `${shownPower}`;
+    const soulMark =
+      f.name === "精灵族" ? `<div class="soul-mark">魂${Math.max(0, Number(f?.elf?.soul) || 0)}</div>` : "";
+    const pidForElf = String(f?.id ?? "").split(":")[0];
+    let elfPickHtml = "";
+    if (f.name === "精灵族" && f.elf && state.phase === PHASE.BATTLE && state.pendingElfPickByPlayer?.[pidForElf]) {
+      const spirits = Array.isArray(f.elf.spirits) ? f.elf.spirits : [];
+      const dead = Array.isArray(f.elf.dead) ? f.elf.dead : [false, false, false];
+      const soul = Math.max(0, Number(f?.elf?.soul) || 0);
+      const pendingKoIndex = Number.isFinite(f?.elf?.pendingKoIndex) ? Number(f.elf.pendingKoIndex) : null;
+      const buttons = [0, 1, 2]
+        .map((i) => {
+          const sp = spirits[i] ?? null;
+          const maxHp = Math.max(0, Number(sp?.maxHp) || 0);
+          const d = dead[i] === true || pendingKoIndex === i;
+          const colStart = 1 + i * 6;
+          return `<button type="button" class="elf-pick-btn${d ? " disabled" : ""}" data-elf-pick="${pidForElf}:${i}" ${
+            d ? "disabled" : ""
+          } style="grid-column:${colStart} / span 6"><div class="elf-pick-title">灵${i + 1}</div><div class="elf-pick-sub">血量${maxHp}</div></button>`;
+        })
+        .join("");
+      elfPickHtml = `
+        <div class="elf-pick-in-card">
+          <div class="elf-pick-hint">${pendingKoIndex != null ? "选择下一位灵" : "选择进入游戏的灵"}（魂=${soul}）</div>
+          <div class="elf-pick-row-grid" style="--hp-cells:30">${buttons}</div>
+        </div>
+      `;
+    }
 
     let powerDeltaHtml = "";
+    let powerOverlay = null;
     let hpOverlay = null;
     const overlay =
       !comparing && state.phase === PHASE.BATTLE && lastRound?.before?.has(f.id) && lastRound?.after?.has(f.id)
@@ -2043,27 +3333,36 @@ function createApp() {
       const a = overlay.after.get(f.id);
       const dp = (a.power ?? 0) - (b.power ?? 0);
       const dh = (a.hp ?? 0) - (b.hp ?? 0);
-      if (dp !== 0) {
-        powerDeltaHtml = `<span class="delta-power ${dp > 0 ? "delta-up" : "delta-down"}">${dp > 0 ? "↑" : "↓"}${Math.abs(dp)}</span>`;
-      }
+      if (dp !== 0) powerOverlay = { oldPower: b.power, powerDelta: dp, showPowerDelta: true };
       const hpPath = overlay?.hpTraceById?.get?.(f.id) ?? null;
       hpOverlay = { oldHp: b.hp, hpDelta: dh, showHpDelta: true, hpPath };
     }
+    let hpHtml = renderHpGrid({ ...f, hp: shownHp }, hpOverlay);
+    if (f.name === "精灵族" && f.elf) {
+      hpHtml = renderElfHpGrid(f, shownHp, hpOverlay);
+    }
+    const powerHtml = renderPowerGrid({ ...f, power: shownPower }, powerOverlay);
     return `
       <div class="fighter${isMain ? " fighter-main" : ""}">
         ${policeMark}
         ${flameMark}
+        ${ningMark}
+        ${guardMark}
+        ${golemBlockMark}
         <div class="fighter-top">
+          ${headshot}
           <div class="fighter-name">${f.name}</div>
+          ${soulMark}
           ${isKo ? `<div class="ko-badge">KO!</div>` : ""}
         </div>
-        ${renderHpGrid({ ...f, hp: shownHp }, hpOverlay)}
+        ${hpHtml}
+        ${powerHtml}
+        ${elfPickHtml}
         ${revBar}
         ${shipBar}
+        ${rageBar}
+        ${planBar}
         ${snakeBar}
-        <div class="fighter-stats">
-          <div class="stat stat-power">力量: <span class="power-value">${pText}</span>${powerDeltaHtml}</div>
-        </div>
       </div>
     `;
   }
@@ -2115,6 +3414,74 @@ function createApp() {
     const p2Main = state.phase === PHASE.BATTLE && state.lastFlip ? state.lastFlip.p2Card?.fighterName : null;
     els.p1Fighters.innerHTML = p1.fighters.map((f) => renderFighter(f, { isMain: p1Main === f.name })).join("");
     els.p2Fighters.innerHTML = p2.fighters.map((f) => renderFighter(f, { isMain: p2Main === f.name })).join("");
+    document.querySelectorAll(`[data-elf-pick]`).forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const raw = btn.getAttribute("data-elf-pick") || "";
+        const [pid, idxStr] = raw.split(":");
+        const idx = Number(idxStr);
+        const player = state.players?.[pid];
+        const oppId = pid === "p1" ? "p2" : "p1";
+        const elf = player?.fighters?.find?.((x) => x?.name === "精灵族");
+        if (!elf || !elf.elf) return;
+        const dead = Array.isArray(elf.elf.dead) ? elf.elf.dead : [false, false, false];
+        if (!Number.isFinite(idx) || idx < 0 || idx > 2) return;
+        const pendingKoIndex = Number.isFinite(elf.elf.pendingKoIndex) ? Number(elf.elf.pendingKoIndex) : null;
+        if (dead[idx] === true) return;
+        if (pendingKoIndex === idx) return;
+        const wasKoPick = pendingKoIndex != null;
+        if (pendingKoIndex != null) {
+          dead[pendingKoIndex] = true;
+          elf.elf.pendingKoIndex = null;
+        }
+        const spirit = elf.elf.spirits?.[idx];
+        const maxHp = Number(spirit?.maxHp) || 0;
+        if (maxHp <= 0) return;
+        elf.elf.dead = dead;
+        elf.elf.active = idx;
+        elf.elf.pendingPick = false;
+        elf.hp = maxHp;
+        elf.maxHp = maxHp;
+        elf.hpRules = Array.isArray(spirit?.hpRules) ? spirit.hpRules : [];
+        state.pendingElfPickByPlayer[pid] = false;
+        pushLog(`灵：${pid.toUpperCase()} 选择灵${idx + 1}（HP=${maxHp}，魂=${Number(elf.elf.soul) || 0}）`);
+        const enterEffects = (elf.hpRules ?? []).filter((r) => r?.hp === elf.hp && r.stop !== true).flatMap((r) => r.effects ?? []);
+        if (enterEffects.length) {
+          const other = player.fighters.find((x) => x.id !== elf.id);
+          const opp = state.players[oppId];
+          const oppMain = opp?.fighters?.[0];
+          const oppSup = opp?.fighters?.[1];
+          const startPower = new Map();
+          for (const f of [...player.fighters, ...opp.fighters]) startPower.set(f.id, Number(f.power) || 0);
+          const ctx = {
+            kind: "battle",
+            my: { playerId: pid, mainId: elf.id, supportId: other?.id, bothIds: [elf.id, other?.id].filter(Boolean) },
+            opp: { playerId: oppId, mainId: oppMain?.id, supportId: oppSup?.id, bothIds: [oppMain?.id, oppSup?.id].filter(Boolean) },
+            startPower,
+          };
+          const settlement = settleEffects({
+            ctx,
+            myCard: { fighterName: "精灵族", text: "", id: "elf-enter" },
+            oppCard: { fighterName: "对手", text: "", id: "elf-enter-opp" },
+            myEffects: enterEffects,
+            oppEffects: [],
+            myPlayer: player,
+            oppPlayer: opp,
+          });
+          const beforeSnapshot = snapshotFighters();
+          applyDeltas(state, settlement.hpDelta, settlement.powerDelta, beforeSnapshot, null, null, null);
+        }
+        if (wasKoPick) {
+          state.lastRound = null;
+          state.lastIntermissionEffect = null;
+          state.compareHold = false;
+          state.lastFlip = null;
+          render();
+          battleTurn();
+          return;
+        }
+        render();
+      });
+    });
 
     els.p1BattleCount.textContent = `战斗牌库: ${p1.battleDeck.length}`;
     els.p1ConstructCount.textContent = `构筑牌库: ${p1.constructionDeck.length}`;
@@ -2204,6 +3571,22 @@ function createApp() {
       return;
     }
     const { p1Card, p2Card, round, turn } = last;
+    const planEvents =
+      state.lastRound && state.lastRound.round === round && state.lastRound.turn === turn ? state.lastRound.planEvents ?? [] : [];
+    const planHtml = (side) => {
+      const pid = side === "P2" ? "p2" : "p1";
+      const list = planEvents.filter((e) => e?.playerId === pid && e?.kind === "execute");
+      if (list.length === 0) return "";
+      const items = list
+        .map((e) => {
+          const source = e.source === "hpRule" ? `HP${e.triggerHp ?? ""}` : "卡";
+          const title = `${source}实施`;
+          const body = e.result === "empty" ? "无可实施" : String(e.planText ?? "").trim();
+          return `<div class="plan-mini"><div class="plan-mini-title">${escapeHtml(title)}</div><div class="plan-mini-body">${escapeHtml(body || "-")}</div></div>`;
+        })
+        .join("");
+      return `<div class="battle-card-plans">${items}</div>`;
+    };
     const cardHtml = (side, card) => `
       <div class="battle-card" data-side="${side}">
         <div class="battle-card-top">
@@ -2211,6 +3594,7 @@ function createApp() {
           <div class="battle-card-title">${cardTitleHtml(card)}</div>
         </div>
         <div class="battle-card-body">${displayCardText(card)}</div>
+        ${planHtml(side)}
       </div>
     `;
     els.battleReveal.innerHTML = `
@@ -2228,7 +3612,10 @@ function createApp() {
     els.constructionPanel.innerHTML = "";
     if (state.phase === PHASE.SETUP) {
       const pool = new Map(data.fighterDefs.map((f) => [f.name, f]));
-      const names = data.fighterDefs.map((f) => f.name);
+      const names = [...data.fighterDefs]
+        .slice()
+        .sort((a, b) => (Number(a.code) || 0) - (Number(b.code) || 0))
+        .map((f) => f.name);
       if (names.length < 2) {
         els.constructionPanel.innerHTML = `<div class="construction-card">战士库不足，无法开始游戏</div>`;
         return;
@@ -2247,7 +3634,7 @@ function createApp() {
         const text = cardText(fighterName);
         const n1 = cardName1(fighterName);
         return `
-          <div class="insert-card ${variant}" draggable="true" data-setup="true" data-player="${playerId}" data-name="${fighterName}">
+          <div class="insert-card ${variant}" draggable="false" data-setup="true" data-player="${playerId}" data-name="${fighterName}">
             <div class="insert-title">${fighterName}${n1 ? ` · ${n1}` : "#1"}</div>
             <div class="insert-text">${text}</div>
           </div>
@@ -2256,27 +3643,57 @@ function createApp() {
 
       const setupBoardHtml = (playerId, built) => {
         let html = "";
-        for (let i = 0; i <= built.length; i++) {
-          html += `<div class="dropzone" data-setup-zone="true" data-player="${playerId}" data-pos="${i}">放这里</div>`;
-          if (i < built.length) {
-            const name = built[i];
+        const arr = Array.isArray(built) ? built : [];
+        html += `<div class="setup-board-slot" data-setup-slot="top" data-player="${playerId}">放到顶</div>`;
+        if (arr.length === 0) {
+          html += `<div class="setup-board-empty">（空）</div>`;
+        } else {
+          for (let i = 0; i < arr.length; i++) {
+            const name = arr[i];
             const n1 = cardName1(name);
             html += `
-              <div class="deck-card setup-built" draggable="true" data-setup="true" data-player="${playerId}" data-name="${name}">
+              <div class="deck-card setup-built" draggable="false" data-setup="true" data-player="${playerId}" data-name="${name}">
                 <div class="deck-title">${i === 0 ? "顶" : "底"}：${name}${n1 ? ` · ${n1}` : "#1"}</div>
                 <div class="deck-text">${cardText(name)}</div>
               </div>
             `;
           }
         }
+        html += `<div class="setup-board-slot" data-setup-slot="bottom" data-player="${playerId}">放到底</div>`;
         return html;
       };
 
       if (setup.step === "pick") {
         const slotLabel = (v, fallback) =>
           v
-            ? `<div class="setup-picked" draggable="true" data-setup-pick="picked" data-name="${escapeHtml(v)}">${escapeHtml(v)}</div>`
+            ? `<div class="setup-picked" draggable="true" data-setup-pick="picked" data-name="${escapeHtml(v)}">${headshotImgHtml(
+                v,
+                "setup-headshot"
+              )}<div class="setup-fighter-name">${escapeHtml(v)}</div></div>`
             : `<div class="setup-slot-placeholder">${fallback}</div>`;
+
+        const pickedByP1 = new Set([setup.p1a, setup.p1b].filter(Boolean));
+        const pickedByP2 = new Set([setup.p2a, setup.p2b].filter(Boolean));
+        const gridNames = names.slice(0, 12);
+        const poolCells = [];
+        for (let i = 0; i < 12; i++) {
+          const n = gridNames[i] ?? null;
+          if (!n) {
+            poolCells.push(`<div class="setup-fighter placeholder"></div>`);
+            continue;
+          }
+          const takenBy = pickedByP1.has(n) ? "p1" : pickedByP2.has(n) ? "p2" : null;
+          const disabled = takenBy != null;
+          const title = takenBy === "p1" ? "已被P1选择" : takenBy === "p2" ? "已被P2选择" : "";
+          poolCells.push(
+            `<div class="setup-fighter${disabled ? " disabled" : ""}" ${title ? `title="${title}"` : ""} draggable="${
+              disabled ? "false" : "true"
+            }" data-setup-pick="fighter" data-name="${escapeHtml(n)}">${headshotImgHtml(
+              n,
+              "setup-headshot"
+            )}<div class="setup-fighter-name">${escapeHtml(n)}</div></div>`
+          );
+        }
 
         els.constructionPanel.innerHTML = `
           <div class="construction-card">
@@ -2284,19 +3701,16 @@ function createApp() {
             <div class="setup-pick-grid">
               <div class="setup-side" data-player="p1">
                 <div class="setup-side-title"><strong>P1</strong></div>
-                <div class="setup-pool" data-player="p1">
-                  ${names.map((n) => `<div class="setup-fighter" draggable="true" data-setup-pick="fighter" data-name="${escapeHtml(n)}">${escapeHtml(n)}</div>`).join("")}
-                </div>
                 <div class="setup-slots">
                   <div class="setup-slot" data-setup-pick="slot" data-player="p1" data-slot="a">${slotLabel(setup.p1a, "空槽1")}</div>
                   <div class="setup-slot" data-setup-pick="slot" data-player="p1" data-slot="b">${slotLabel(setup.p1b, "空槽2")}</div>
                 </div>
               </div>
+              <div class="setup-pool setup-pool-grid" data-player="pool">
+                ${poolCells.join("")}
+              </div>
               <div class="setup-side" data-player="p2">
                 <div class="setup-side-title"><strong>P2</strong></div>
-                <div class="setup-pool" data-player="p2">
-                  ${names.map((n) => `<div class="setup-fighter" draggable="true" data-setup-pick="fighter" data-name="${escapeHtml(n)}">${escapeHtml(n)}</div>`).join("")}
-                </div>
                 <div class="setup-slots">
                   <div class="setup-slot" data-setup-pick="slot" data-player="p2" data-slot="a">${slotLabel(setup.p2a, "空槽1")}</div>
                   <div class="setup-slot" data-setup-pick="slot" data-player="p2" data-slot="b">${slotLabel(setup.p2b, "空槽2")}</div>
@@ -2312,6 +3726,8 @@ function createApp() {
         `;
 
         const setSlot = (pid, slot, name) => {
+          const oppPicked = pid === "p1" ? new Set([setup.p2a, setup.p2b].filter(Boolean)) : new Set([setup.p1a, setup.p1b].filter(Boolean));
+          if (oppPicked.has(name)) return false;
           const key = pid === "p1" ? (slot === "a" ? "p1a" : "p1b") : slot === "a" ? "p2a" : "p2b";
           const otherKey = pid === "p1" ? (slot === "a" ? "p1b" : "p1a") : slot === "a" ? "p2b" : "p2a";
           const cur = setup[key] ?? null;
@@ -2320,6 +3736,7 @@ function createApp() {
             setup[otherKey] = cur;
           }
           setup[key] = name;
+          return true;
         };
 
         const slots = els.constructionPanel.querySelectorAll(`[data-setup-pick="slot"]`);
@@ -2339,7 +3756,12 @@ function createApp() {
             if (!pid || !slot) return;
             if (raw.startsWith("pick:")) {
               const name = raw.slice("pick:".length);
-              setSlot(pid, slot, name);
+              const ok = setSlot(pid, slot, name);
+              if (!ok) {
+                window.alert("对手已选择该战士");
+                render();
+                return;
+              }
               render();
               return;
             }
@@ -2360,6 +3782,10 @@ function createApp() {
 
         els.constructionPanel.querySelectorAll(`[data-setup-pick="fighter"]`).forEach((el) => {
           el.addEventListener("dragstart", (ev) => {
+            if (el.classList.contains("disabled") || el.classList.contains("placeholder")) {
+              ev.preventDefault();
+              return;
+            }
             const name = el.getAttribute("data-name");
             ev.dataTransfer.setData("text/plain", `pick:${name}`);
             ev.dataTransfer.effectAllowed = "copy";
@@ -2472,76 +3898,184 @@ function createApp() {
       boardP1.innerHTML = `<div style="opacity:0.8;margin-bottom:8px;">战斗牌堆（从上到下）</div>` + setupBoardHtml("p1", setup.p1Built);
       boardP2.innerHTML = `<div style="opacity:0.8;margin-bottom:8px;">战斗牌堆（从上到下）</div>` + setupBoardHtml("p2", setup.p2Built);
 
-      const setupDragSelector = `.insert-card[data-setup="true"], .deck-card[data-setup="true"]`;
-      els.constructionPanel.querySelectorAll(setupDragSelector).forEach((el) => {
-        el.addEventListener("dragstart", (ev) => {
-          const pid = el.getAttribute("data-player");
-          const name = el.getAttribute("data-name");
-          ev.dataTransfer.setData("text/plain", `setup:${pid}:${name}`);
-          ev.dataTransfer.effectAllowed = "move";
-          el.classList.add("dragging");
-          if (pid === "p1") boardP1.classList.add("dragging");
-          if (pid === "p2") boardP2.classList.add("dragging");
-        });
-        el.addEventListener("dragend", () => {
-          el.classList.remove("dragging");
-          boardP1.classList.remove("dragging");
-          boardP2.classList.remove("dragging");
-        });
-      });
+      const setupDragCardSelector = `.insert-card[data-setup="true"], .deck-card[data-setup="true"]`;
+      const mkTag = (el) => {
+        if (!el) return "null";
+        const tn = String(el.tagName || "").toLowerCase();
+        const cls = (el.className || "").toString().split(/\s+/).filter(Boolean).join(".");
+        const id = el.id ? `#${el.id}` : "";
+        return `${tn}${id}${cls ? "." + cls : ""}`;
+      };
+      const logDbg = (s) => {
+        if ((window.__setupDragDbgCount ?? 0) >= 80) return;
+        window.__setupDragDbgCount = (window.__setupDragDbgCount ?? 0) + 1;
+        pushLog(`[DBG-SETUP-DRAG] ${s}`);
+      };
 
-      els.constructionPanel.querySelectorAll(`.dropzone[data-setup-zone="true"]`).forEach((zone) => {
-        zone.addEventListener("dragover", (ev) => {
-          ev.preventDefault();
-          zone.classList.add("active");
-          ev.dataTransfer.dropEffect = "move";
-        });
-        zone.addEventListener("dragleave", () => {
-          zone.classList.remove("active");
-        });
-        zone.addEventListener("drop", (ev) => {
-          ev.preventDefault();
-          zone.classList.remove("active");
-          const raw = ev.dataTransfer.getData("text/plain");
-          const parts = raw.split(":");
-          if (parts.length !== 3 || parts[0] !== "setup") return;
-          const pid = parts[1];
-          const name = parts[2];
-          const playerId = zone.getAttribute("data-player");
-          if (pid !== playerId) return;
-          const pos = Number(zone.getAttribute("data-pos"));
-          if (!Number.isFinite(pos)) return;
-          const oldEl = els.constructionPanel.querySelector(`${setupDragSelector}[data-player="${pid}"][data-name="${name}"]`);
-          const oldRect = oldEl ? oldEl.getBoundingClientRect() : null;
-          const key = pid === "p1" ? "p1Built" : "p2Built";
-          const arr = [...setup[key]];
-          const idx = arr.indexOf(name);
-          if (idx >= 0) arr.splice(idx, 1);
-          arr.splice(Math.max(0, Math.min(pos, arr.length)), 0, name);
-          setup[key] = arr.slice(0, 2);
-          render();
-          if (oldRect) {
-            const newEl = els.constructionPanel.querySelector(`${setupDragSelector}[data-player="${pid}"][data-name="${name}"]`);
-            if (newEl) {
-              const newRect = newEl.getBoundingClientRect();
-              const dx = oldRect.left - newRect.left;
-              const dy = oldRect.top - newRect.top;
-              newEl.style.transition = "transform 0s";
-              newEl.style.transform = `translate(${dx}px, ${dy}px)`;
-              requestAnimationFrame(() => {
-                newEl.style.transition = "transform 160ms ease";
-                newEl.style.transform = "translate(0px, 0px)";
-              });
-              const onEnd = () => {
-                newEl.style.transition = "";
-                newEl.style.transform = "";
-                newEl.removeEventListener("transitionend", onEnd);
-              };
-              newEl.addEventListener("transitionend", onEnd);
-            }
+      const cleanupDrag = () => {
+        const ghost = document.getElementById("setup-drag-ghost");
+        if (ghost) ghost.remove();
+        document.body.classList.remove("setup-dragging");
+        boardP1.classList.remove("setup-drop-active");
+        boardP2.classList.remove("setup-drop-active");
+        pendingP1.classList.remove("setup-drop-active");
+        pendingP2.classList.remove("setup-drop-active");
+      };
+
+      const applyDrop = (pid, name, over) => {
+        if (!pid || !name || !over) return false;
+        const key = pid === "p1" ? "p1Built" : "p2Built";
+        const arr = [...setup[key]];
+        const fromIdx = arr.indexOf(name);
+        if (over.kind === "pending") {
+          if (fromIdx < 0) return false;
+          arr.splice(fromIdx, 1);
+          setup[key] = arr;
+          return true;
+        }
+        if (over.kind === "board") {
+          const insertPos = Number(over.insertPos);
+          if (!Number.isFinite(insertPos)) return false;
+          if (fromIdx >= 0) arr.splice(fromIdx, 1);
+          if (!arr.includes(name)) {
+            const pos = Math.max(0, Math.min(insertPos, arr.length));
+            arr.splice(pos, 0, name);
           }
+          setup[key] = arr.slice(0, 2);
+          return true;
+        }
+        return false;
+      };
+
+      const computeOver = (pid, x, y) => {
+        const pt = document.elementFromPoint(x, y);
+        if (!pt) return null;
+        const slotEl = pt.closest(`.setup-board-slot[data-player="${pid}"]`);
+        if (slotEl) {
+          const where = slotEl.getAttribute("data-setup-slot");
+          const key = pid === "p1" ? "p1Built" : "p2Built";
+          const count = Array.isArray(setup[key]) ? setup[key].length : 0;
+          return { kind: "board", insertPos: where === "top" ? 0 : count };
+        }
+        const pendingEl = pt.closest(`#setup-pending-${pid}`);
+        if (pendingEl) return { kind: "pending" };
+        const boardEl = pt.closest(`#setup-board-${pid}`);
+        if (boardEl) {
+          const cards = [...boardEl.querySelectorAll(`${setupDragCardSelector}[data-player="${pid}"]`)];
+          if (!cards.length) return { kind: "board", insertPos: 0 };
+          for (let i = 0; i < cards.length; i++) {
+            const r = cards[i].getBoundingClientRect();
+            const mid = r.top + r.height / 2;
+            if (y < mid) return { kind: "board", insertPos: i };
+          }
+          return { kind: "board", insertPos: cards.length };
+        }
+        return null;
+      };
+
+      const attachPointerDrag = (el) => {
+        el.addEventListener("pointerdown", (ev) => {
+          if (ev.button != null && ev.button !== 0) return;
+          const cardEl = ev.target?.closest?.(setupDragCardSelector);
+          if (!cardEl) return;
+          const pid = cardEl.getAttribute("data-player");
+          const name = cardEl.getAttribute("data-name");
+          if (!pid || !name) return;
+          ev.preventDefault();
+          try {
+            cardEl.setPointerCapture(ev.pointerId);
+          } catch {}
+
+          cleanupDrag();
+          document.body.classList.add("setup-dragging");
+
+          const rect = cardEl.getBoundingClientRect();
+          const ghost = cardEl.cloneNode(true);
+          ghost.id = "setup-drag-ghost";
+          ghost.style.width = `${Math.max(160, rect.width)}px`;
+          ghost.style.left = `${rect.left}px`;
+          ghost.style.top = `${rect.top}px`;
+          ghost.style.position = "fixed";
+          ghost.style.zIndex = "9999";
+          ghost.style.pointerEvents = "none";
+          ghost.style.opacity = "0.92";
+          ghost.style.transform = "scale(1.02)";
+          document.body.appendChild(ghost);
+
+          const drag = {
+            pid,
+            name,
+            pointerId: ev.pointerId,
+            offX: ev.clientX - rect.left,
+            offY: ev.clientY - rect.top,
+            over: null,
+            moved: false,
+          };
+          window.__setupPointerDrag = drag;
+          logDbg(`PTR start pid=${pid} name=${name} target=${mkTag(ev.target)} card=${mkTag(cardEl)}`);
+
+          const move = (e) => {
+            if (!window.__setupPointerDrag || window.__setupPointerDrag.pointerId !== e.pointerId) return;
+            const d = window.__setupPointerDrag;
+            d.moved = true;
+            const nx = e.clientX - d.offX;
+            const ny = e.clientY - d.offY;
+            ghost.style.left = `${nx}px`;
+            ghost.style.top = `${ny}px`;
+            const over = computeOver(d.pid, e.clientX, e.clientY);
+            d.over = over;
+            boardP1.classList.toggle("setup-drop-active", d.pid === "p1" && over?.kind === "board");
+            boardP2.classList.toggle("setup-drop-active", d.pid === "p2" && over?.kind === "board");
+            pendingP1.classList.toggle("setup-drop-active", d.pid === "p1" && over?.kind === "pending");
+            pendingP2.classList.toggle("setup-drop-active", d.pid === "p2" && over?.kind === "pending");
+            document.querySelectorAll(`.setup-board-slot[data-player="${d.pid}"]`).forEach((x) => x.classList.remove("active"));
+            if (over?.kind === "board") {
+              const key = d.pid === "p1" ? "p1Built" : "p2Built";
+              const count = Array.isArray(setup[key]) ? setup[key].length : 0;
+              const which = Number(over.insertPos) === 0 ? "top" : Number(over.insertPos) >= count ? "bottom" : null;
+              if (which) {
+                const slot = document.querySelector(`.setup-board-slot[data-player="${d.pid}"][data-setup-slot="${which}"]`);
+                if (slot) slot.classList.add("active");
+              }
+            }
+          };
+          const up = (e) => {
+            if (!window.__setupPointerDrag || window.__setupPointerDrag.pointerId !== e.pointerId) return;
+            const d = window.__setupPointerDrag;
+            window.__setupPointerDrag = null;
+            const ok = applyDrop(d.pid, d.name, d.over);
+            logDbg(`PTR end pid=${d.pid} name=${d.name} over=${d.over?.kind ?? "null"} ok=${ok ? "1" : "0"}`);
+            cleanupDrag();
+            if (ok) render();
+          };
+          const cancel = (e) => {
+            if (!window.__setupPointerDrag || window.__setupPointerDrag.pointerId !== e.pointerId) return;
+            window.__setupPointerDrag = null;
+            cleanupDrag();
+            logDbg(`PTR cancel pid=${pid} name=${name}`);
+          };
+
+          cardEl.addEventListener("pointermove", move);
+          cardEl.addEventListener(
+            "pointerup",
+            (e) => {
+              cardEl.removeEventListener("pointermove", move);
+              up(e);
+            },
+            { once: true }
+          );
+          cardEl.addEventListener(
+            "pointercancel",
+            (e) => {
+              cardEl.removeEventListener("pointermove", move);
+              cancel(e);
+            },
+            { once: true }
+          );
         });
-      });
+      };
+
+      els.constructionPanel.querySelectorAll(setupDragCardSelector).forEach((el) => attachPointerDrag(el));
 
       const startBtn = document.getElementById("setup-start");
       startBtn.disabled = setup.p1Built.length !== 2 || setup.p2Built.length !== 2;
@@ -2671,6 +4205,41 @@ function createApp() {
       const playerId = card.getAttribute("data-player");
       const choice = state.construction[playerId];
       if (!choice) return;
+
+      const boardEl = card.querySelector(`.insert-board[data-player="${playerId}"]`);
+      const computePos = (ev) => {
+        const targetCard = ev.target?.closest?.(`.deck-card[data-index]`);
+        if (targetCard) {
+          const idx = Number(targetCard.getAttribute("data-index"));
+          if (Number.isFinite(idx)) {
+            const rect = targetCard.getBoundingClientRect();
+            const mid = rect.top + rect.height / 2;
+            return ev.clientY < mid ? idx : idx + 1;
+          }
+        }
+        const cards = Array.from(boardEl.querySelectorAll(`.deck-card[data-index]`));
+        if (cards.length === 0) return 0;
+        for (const el of cards) {
+          const idx = Number(el.getAttribute("data-index"));
+          if (!Number.isFinite(idx)) continue;
+          const rect = el.getBoundingClientRect();
+          const mid = rect.top + rect.height / 2;
+          if (ev.clientY < mid) return idx;
+        }
+        const lastIdx = Number(cards[cards.length - 1].getAttribute("data-index"));
+        return Number.isFinite(lastIdx) ? lastIdx + 1 : cards.length;
+      };
+      const computePosByX = (ev) => {
+        const rect = boardEl.getBoundingClientRect();
+        const x = ev.clientX;
+        const y = ev.clientY;
+        if (!(x >= rect.left && x <= rect.right)) return null;
+        const cards = Array.from(boardEl.querySelectorAll(`.deck-card[data-index]`));
+        const endPos = cards.length;
+        if (y < rect.top) return 0;
+        if (y > rect.bottom) return endPos;
+        return computePos(ev);
+      };
       card.querySelectorAll(`.construction-choice.selectable[data-player="${playerId}"]`).forEach((el) => {
         el.addEventListener("click", () => {
           const nextIdx = Number(el.getAttribute("data-drawn-idx"));
@@ -2692,6 +4261,88 @@ function createApp() {
           ev.dataTransfer.effectAllowed = "move";
           el.classList.add("dragging");
           choice.dragging = true;
+          activeInsertDrag = playerId;
+          if (!choice._globalInsertDragHandlers) {
+            const computePosByXNow = (ev) => {
+              const boardNow = els.constructionPanel.querySelector(
+                `.construction-card[data-player="${playerId}"] .insert-board[data-player="${playerId}"]`
+              );
+              if (!boardNow) return { pos: null, reason: "no-board", rect: null };
+              const rect = boardNow.getBoundingClientRect();
+              const x = ev.clientX;
+              const y = ev.clientY;
+              const inX = x >= rect.left && x <= rect.right;
+              if (!inX) return { pos: null, reason: "x-out", rect, x, y };
+              const cards = Array.from(boardNow.querySelectorAll(`.deck-card[data-index]`));
+              const endPos = cards.length;
+              if (y < rect.top) return { pos: 0, reason: "above", rect, x, y, endPos };
+              if (y > rect.bottom) return { pos: endPos, reason: "below", rect, x, y, endPos };
+              if (cards.length === 0) return { pos: 0, reason: "empty", rect, x, y, endPos };
+              for (const el of cards) {
+                const idx = Number(el.getAttribute("data-index"));
+                if (!Number.isFinite(idx)) continue;
+                const r = el.getBoundingClientRect();
+                const mid = r.top + r.height / 2;
+                if (y < mid) return { pos: idx, reason: "mid", rect, x, y, endPos };
+              }
+              const lastIdx = Number(cards[cards.length - 1].getAttribute("data-index"));
+              const pos = Number.isFinite(lastIdx) ? lastIdx + 1 : endPos;
+              return { pos, reason: "after-last", rect, x, y, endPos };
+            };
+            const onOver = (e) => {
+              if (activeInsertDrag !== playerId) return;
+              const r = computePosByXNow(e);
+              if (r.pos == null) {
+                return;
+              }
+              e.preventDefault();
+              e.dataTransfer.dropEffect = "move";
+              if (choice.previewPos !== r.pos) {
+                choice.previewPos = r.pos;
+                choice.dragging = true;
+                scheduleRender();
+              }
+            };
+            const onDrop = (e) => {
+              if (activeInsertDrag !== playerId) return;
+              const r = computePosByXNow(e);
+              if (r.pos == null) {
+                return;
+              }
+              e.preventDefault();
+              e.stopPropagation();
+              const oldEl = card.querySelector(dragSelector);
+              const oldRect = oldEl ? oldEl.getBoundingClientRect() : null;
+              choice.insertPos = r.pos;
+              choice.previewPos = null;
+              choice.dragging = false;
+              activeInsertDrag = null;
+              render();
+              if (oldRect) {
+                const newEl = els.constructionPanel.querySelector(`.construction-card[data-player="${playerId}"] ${dragSelector}`);
+                if (newEl) {
+                  const newRect = newEl.getBoundingClientRect();
+                  const dx = oldRect.left - newRect.left;
+                  const dy = oldRect.top - newRect.top;
+                  newEl.style.transition = "transform 0s";
+                  newEl.style.transform = `translate(${dx}px, ${dy}px)`;
+                  requestAnimationFrame(() => {
+                    newEl.style.transition = "transform 160ms ease";
+                    newEl.style.transform = "translate(0px, 0px)";
+                  });
+                  const onEnd = () => {
+                    newEl.style.transition = "";
+                    newEl.style.transform = "";
+                    newEl.removeEventListener("transitionend", onEnd);
+                  };
+                  newEl.addEventListener("transitionend", onEnd);
+                }
+              }
+            };
+            choice._globalInsertDragHandlers = { onOver, onDrop };
+            document.addEventListener("dragover", onOver, true);
+            document.addEventListener("drop", onDrop, true);
+          }
           choice.previewPos = Number.isFinite(choice.insertPos) ? choice.insertPos : 0;
           scheduleRender();
         });
@@ -2699,6 +4350,12 @@ function createApp() {
           el.classList.remove("dragging");
           choice.dragging = false;
           choice.previewPos = null;
+          activeInsertDrag = null;
+          if (choice._globalInsertDragHandlers) {
+            document.removeEventListener("dragover", choice._globalInsertDragHandlers.onOver, true);
+            document.removeEventListener("drop", choice._globalInsertDragHandlers.onDrop, true);
+            choice._globalInsertDragHandlers = null;
+          }
           scheduleRender();
         });
       });
@@ -2751,30 +4408,6 @@ function createApp() {
         });
       });
 
-      const boardEl = card.querySelector(`.insert-board[data-player="${playerId}"]`);
-      const computePos = (ev) => {
-        const targetCard = ev.target?.closest?.(`.deck-card[data-index]`);
-        if (targetCard) {
-          const idx = Number(targetCard.getAttribute("data-index"));
-          if (Number.isFinite(idx)) {
-            const rect = targetCard.getBoundingClientRect();
-            const mid = rect.top + rect.height / 2;
-            return ev.clientY < mid ? idx : idx + 1;
-          }
-        }
-        const cards = Array.from(boardEl.querySelectorAll(`.deck-card[data-index]`));
-        if (cards.length === 0) return 0;
-        for (const el of cards) {
-          const idx = Number(el.getAttribute("data-index"));
-          if (!Number.isFinite(idx)) continue;
-          const rect = el.getBoundingClientRect();
-          const mid = rect.top + rect.height / 2;
-          if (ev.clientY < mid) return idx;
-        }
-        const lastIdx = Number(cards[cards.length - 1].getAttribute("data-index"));
-        return Number.isFinite(lastIdx) ? lastIdx + 1 : cards.length;
-      };
-
       boardEl.addEventListener(
         "dragover",
         (ev) => {
@@ -2791,6 +4424,66 @@ function createApp() {
         },
         true
       );
+
+      const insertAreaEl = card.querySelector(`.insert-area`);
+      if (insertAreaEl) {
+        insertAreaEl.addEventListener(
+          "dragover",
+          (ev) => {
+            const raw = ev.dataTransfer.getData("text/plain");
+            if (raw !== `insert:${playerId}`) return;
+            const pos = computePosByX(ev);
+            if (pos == null) return;
+            ev.preventDefault();
+            ev.dataTransfer.dropEffect = "move";
+            if (choice.previewPos !== pos) {
+              choice.previewPos = pos;
+              choice.dragging = true;
+              scheduleRender();
+            }
+          },
+          true
+        );
+
+        insertAreaEl.addEventListener(
+          "drop",
+          (ev) => {
+            const raw = ev.dataTransfer.getData("text/plain");
+            if (raw !== `insert:${playerId}`) return;
+            const pos = computePosByX(ev);
+            if (pos == null) return;
+            ev.preventDefault();
+            ev.stopPropagation();
+            const oldEl = card.querySelector(dragSelector);
+            const oldRect = oldEl ? oldEl.getBoundingClientRect() : null;
+            choice.insertPos = pos;
+            choice.previewPos = null;
+            choice.dragging = false;
+            render();
+            if (oldRect) {
+              const newEl = els.constructionPanel.querySelector(`.construction-card[data-player="${playerId}"] ${dragSelector}`);
+              if (newEl) {
+                const newRect = newEl.getBoundingClientRect();
+                const dx = oldRect.left - newRect.left;
+                const dy = oldRect.top - newRect.top;
+                newEl.style.transition = "transform 0s";
+                newEl.style.transform = `translate(${dx}px, ${dy}px)`;
+                requestAnimationFrame(() => {
+                  newEl.style.transition = "transform 160ms ease";
+                  newEl.style.transform = "translate(0px, 0px)";
+                });
+                const onEnd = () => {
+                  newEl.style.transition = "";
+                  newEl.style.transform = "";
+                  newEl.removeEventListener("transitionend", onEnd);
+                };
+                newEl.addEventListener("transitionend", onEnd);
+              }
+            }
+          },
+          true
+        );
+      }
 
       boardEl.addEventListener(
         "drop",
@@ -2877,7 +4570,11 @@ function createApp() {
         if (w) {
           state.phase = PHASE.GAME_OVER;
           state.winner = w;
-          const isKoNow = (f) => (Array.isArray(f.koLines) && f.koLines.length > 0 ? f.koLines.includes(Number(f.hp) || 0) : Number(f.hp) <= Number(f.koLine));
+          const isKoNow = (f) => {
+            if (f?.koByFlame === true) return true;
+            if (f?.name === "精灵族") return f?.elf?.gameKo === true;
+            return Array.isArray(f.koLines) && f.koLines.length > 0 ? f.koLines.includes(Number(f.hp) || 0) : Number(f.hp) <= Number(f.koLine);
+          };
           const p1KO = state.players.p1.fighters.some(isKoNow);
           const p2KO = state.players.p2.fighters.some(isKoNow);
           const resLine = w === "draw" ? `平局` : w === "p1" ? `P1 胜 / P2 败` : `P2 胜 / P1 败`;
@@ -2901,8 +4598,14 @@ function createApp() {
     els.phase.textContent = phaseLabel();
     const awaiting = state.phase === PHASE.BATTLE && state.awaitingConstruction === true;
     const pendingEnd = state.phase === PHASE.BATTLE && state.pendingGameOver;
-    els.btnNextBattle.disabled = state.phase !== PHASE.BATTLE || awaiting || pendingEnd;
-    els.btnEnterConstruction.disabled = !awaiting || pendingEnd;
+    const pendingElfPick = state.phase === PHASE.BATTLE && (state.pendingElfPickByPlayer?.p1 || state.pendingElfPickByPlayer?.p2);
+    if (state.phase === PHASE.BATTLE && Array.isArray(state.pendingDoubleQueue) && state.pendingDoubleQueue.length > 0) {
+      els.btnNextBattle.textContent = "结算第二次";
+    } else {
+      els.btnNextBattle.textContent = "翻牌并结算";
+    }
+    els.btnNextBattle.disabled = state.phase !== PHASE.BATTLE || awaiting || pendingEnd || pendingElfPick;
+    els.btnEnterConstruction.disabled = !awaiting || pendingEnd || pendingElfPick;
     els.btnCompare.disabled = !(state.phase === PHASE.BATTLE && state.lastRound);
     els.btnConfirmEnd.disabled = !pendingEnd;
   }
@@ -2920,17 +4623,202 @@ function createApp() {
     if (state.pendingGameOver) return;
     const p1 = state.players.p1;
     const p2 = state.players.p2;
+    if (Array.isArray(state.pendingDoubleQueue) && state.pendingDoubleQueue.length > 0) {
+      const pid = state.pendingDoubleQueue.shift();
+      const lf = state.lastFlip;
+      const p1Card = lf?.p1Card;
+      const p2Card = lf?.p2Card;
+      if (!pid || !p1Card || !p2Card) {
+        state.pendingDoubleQueue = [];
+        render();
+        return;
+      }
+      state.lastIntermissionEffect = null;
+      const beforeSnapshot = snapshotFighters();
+      pushLog(`土偶重生：结算第二次（${pid.toUpperCase()} ${formatCardLabel(pid === "p1" ? p1Card : p2Card)}）`);
+      const ctx = buildContextForBattle(p1, p2, p1Card, p2Card);
+      for (const f of [...p1.fighters, ...p2.fighters]) f.snakeFlipMark = null;
+      const p1Effects = ensureCardCompiled(p1Card);
+      const p2Effects = ensureCardCompiled(p2Card);
+      const settlement = settleEffects({
+        ctx,
+        myCard: p1Card,
+        oppCard: p2Card,
+        myEffects: p1Effects,
+        oppEffects: p2Effects,
+        myPlayer: p1,
+        oppPlayer: p2,
+        onlySide: pid,
+        guardAtStartById: lf?.guardAtStartById,
+      });
+      for (const line of settlement.log) pushLog(line);
+      if (settlement?.golemRebirthByPlayerId?.size) {
+        for (const x of settlement.golemRebirthByPlayerId) state.doubleNextByPlayer[x] = true;
+      }
+      const applied = applyDeltas(
+        state,
+        settlement.hpDelta,
+        settlement.powerDelta,
+        beforeSnapshot,
+        lf?.guardAtStartById,
+        settlement?.blockActiveByPlayerId ?? null,
+        settlement?.blockInnerByPlayerId ?? null
+      );
+      for (const line of applied?.log ?? []) pushLog(line);
+      const hpTraceById = applied?.hpTraceById ?? new Map();
+      const planEvents = [...(settlement.planEvents ?? []), ...(applied?.planEvents ?? [])];
+      if (settlement?.removeBothCardsFromGame === true) {
+        pushLog(`移除游戏：P1 ${formatCardLabel(p1Card)} / P2 ${formatCardLabel(p2Card)}`);
+        p1.resolvedPile = p1.resolvedPile.filter((c) => c !== p1Card);
+        p2.resolvedPile = p2.resolvedPile.filter((c) => c !== p2Card);
+      }
+      const afterSnapshot = snapshotFighters();
+      const guardBlocked = new Set([...(settlement?.guardBlockedByPlayerId ?? []), ...(applied?.guardBlockedByPlayerId ?? [])]);
+      const flipTriggered = settlement?.flipTriggeredByCardId && typeof settlement.flipTriggeredByCardId[Symbol.iterator] === "function" ? new Set(settlement.flipTriggeredByCardId) : new Set();
+      state.lastRound = { round: state.round, turn: state.turn, before: beforeSnapshot, after: afterSnapshot, hpTraceById, planEvents, guardBlockedByPlayerId: guardBlocked, flipTriggeredByCardId: flipTriggered };
+      for (const [id, a] of afterSnapshot.entries()) {
+        const b = beforeSnapshot.get(id);
+        if (!b) continue;
+        const dh = (a.hp ?? 0) - (b.hp ?? 0);
+        const dp = (a.power ?? 0) - (b.power ?? 0);
+        if (dh === 0 && dp === 0) continue;
+        const f = [...state.players.p1.fighters, ...state.players.p2.fighters].find((x) => x.id === id);
+        const name = f?.name ?? id;
+        const pid2 = String(id).split(":")[0];
+        const who = pid2 === "p2" ? "P2" : "P1";
+        const parts = [];
+        if (dh !== 0) parts.push(`HP ${dh > 0 ? "+" : ""}${dh}`);
+        if (dp !== 0) parts.push(`力量 ${dp > 0 ? "+" : ""}${dp}`);
+        pushLog(`结算变化：${who} ${name}（${parts.join("，")}）`);
+      }
+
+      if (!state.pendingDoubleQueue.length) {
+        const processElfRoundEnd = (playerId) => {
+          const player = state.players[playerId];
+          const elf = player?.fighters?.find?.((f) => f?.name === "精灵族");
+          if (!elf || !elf.elf) return;
+          if (elf.elf.gameKo === true) return;
+          const active = elf.elf.active;
+          const dead = Array.isArray(elf.elf.dead) ? elf.elf.dead : [false, false, false];
+          elf.elf.dead = dead;
+          if (active == null) {
+            state.pendingElfPickByPlayer[playerId] = dead.some((x) => x === false);
+            return;
+          }
+          if (dead[active] === true) return;
+          if (Number(elf.hp) > Number(elf.koLine)) return;
+          const alreadyPending = Number.isFinite(elf.elf.pendingKoIndex) && elf.elf.pendingKoIndex !== null;
+          if (alreadyPending) return;
+          elf.elf.pendingKoIndex = active;
+          elf.elf.soul = (Number(elf.elf.soul) || 0) + 1;
+          const hasAlive = dead.some((x, i) => i !== active && x === false);
+          if (hasAlive) {
+            state.pendingElfPickByPlayer[playerId] = true;
+            pushLog(`灵：${playerId.toUpperCase()} 灵${active + 1} 被KO（魂=${elf.elf.soul}），请选择下一位灵`);
+          } else {
+            dead[active] = true;
+            elf.elf.dead = dead;
+            elf.elf.pendingKoIndex = null;
+            elf.elf.active = null;
+            elf.elf.pendingPick = false;
+            elf.hp = 0;
+            elf.maxHp = 0;
+            elf.hpRules = [];
+            state.pendingElfPickByPlayer[playerId] = false;
+            pushLog(`灵：${playerId.toUpperCase()} 无存活灵，精灵族进入沉寂（不再受伤/回复）`);
+          }
+        };
+        if (state.pendingElfPickByPlayer) {
+          processElfRoundEnd("p1");
+          processElfRoundEnd("p2");
+        }
+      }
+
+      function isKoNow(fx) {
+        if (fx?.koByFlame === true) return true;
+        if (fx?.name === "精灵族") return fx?.elf?.gameKo === true;
+        if (Array.isArray(fx.koLines) && fx.koLines.length > 0) {
+          return fx.koLines.includes(Number(fx.hp) || 0);
+        }
+        return Number(fx.hp) <= Number(fx.koLine);
+      }
+      const p1KO = state.players.p1.fighters.some(isKoNow);
+      const p2KO = state.players.p2.fighters.some(isKoNow);
+      const flameKoP1 = settlement?.flameKoByPlayerId?.has?.("p1") === true;
+      const flameKoP2 = settlement?.flameKoByPlayerId?.has?.("p2") === true;
+      const winOnSelfKoP1 = settlement?.winOnSelfKoByPlayer?.get?.("p1") === true;
+      const winOnSelfKoP2 = settlement?.winOnSelfKoByPlayer?.get?.("p2") === true;
+      const p1ClaimWin = winOnSelfKoP1 && p1KO;
+      const p2ClaimWin = winOnSelfKoP2 && p2KO;
+
+      let w = checkWinner(state);
+      if (p1ClaimWin || p2ClaimWin) {
+        if (p1ClaimWin && p2ClaimWin) {
+          w = "draw";
+          pushLog(`特殊胜负：双方被KO且均触发“被KO则胜利”，最终为平局`);
+        } else if (p1ClaimWin) {
+          w = "p1";
+          pushLog(`特殊胜负：P1 被KO且触发“被KO则胜利”，最终 P1 获胜`);
+        } else {
+          w = "p2";
+          pushLog(`特殊胜负：P2 被KO且触发“被KO则胜利”，最终 P2 获胜`);
+        }
+      } else if ((flameKoP1 && !flameKoP2) || (flameKoP2 && !flameKoP1)) {
+        w = flameKoP1 ? "p2" : "p1";
+        pushLog(`特殊胜负：焰=5 判KO，忽略对方本回合KO判定，最终 ${w.toUpperCase()} 获胜`);
+      }
+      if (w) {
+        state.pendingGameOver = w;
+        const koP1 = p1KO ? "KO" : "未KO";
+        const koP2 = p2KO ? "KO" : "未KO";
+        const resLine = w === "draw" ? `平局` : w === "p1" ? `P1 胜 / P2 败` : `P2 胜 / P1 败`;
+        pushLog(`游戏结束！${resLine}（P1 ${koP1}，P2 ${koP2}；点击“确认结束”进入结束结算）`);
+        render();
+        return;
+      }
+
+      if (!state.pendingDoubleQueue.length) {
+        if (p1.battleDeck.length === 0 && p2.battleDeck.length === 0) {
+          state.awaitingConstruction = true;
+          pushLog(`战斗牌库结算完：点击“进入构筑”进入构筑阶段`);
+          render();
+          return;
+        }
+        state.turn += 1;
+      }
+      render();
+      return;
+    }
+
+    if (state.pendingElfPickByPlayer?.p1 || state.pendingElfPickByPlayer?.p2) return;
     if (p1.battleDeck.length === 0 || p2.battleDeck.length === 0) return;
+    const plannedDoubleQueue = [];
+    if (state.doubleNextByPlayer?.p1 === true) {
+      plannedDoubleQueue.push("p1");
+      state.doubleNextByPlayer.p1 = false;
+    }
+    if (state.doubleNextByPlayer?.p2 === true) {
+      plannedDoubleQueue.push("p2");
+      state.doubleNextByPlayer.p2 = false;
+    }
 
     state.lastIntermissionEffect = null;
     const beforeSnapshot = snapshotFighters();
     const p1Card = p1.battleDeck.shift();
     const p2Card = p2.battleDeck.shift();
-    state.lastFlip = { round: state.round, turn: state.turn, p1Card, p2Card };
+    state.lastFlip = {
+      round: state.round,
+      turn: state.turn,
+      p1Card,
+      p2Card,
+      p1FlippedAtStart: p1Card?.flipped === true,
+      p2FlippedAtStart: p2Card?.flipped === true,
+    };
     renderBattleReveal();
     pushLog(`翻牌（轮次${state.round}回合${state.turn}）：P1 ${formatCardLabel(p1Card)} / P2 ${formatCardLabel(p2Card)}`);
 
     const ctx = buildContextForBattle(p1, p2, p1Card, p2Card);
+    state.lastFlip.guardAtStartById = new Map([...p1.fighters, ...p2.fighters].map((f) => [f.id, f?.guard === true]));
     for (const f of [...p1.fighters, ...p2.fighters]) f.snakeFlipMark = null;
     const p1Effects = ensureCardCompiled(p1Card);
     const p2Effects = ensureCardCompiled(p2Card);
@@ -2943,16 +4831,37 @@ function createApp() {
       oppEffects: p2Effects,
       myPlayer: p1,
       oppPlayer: p2,
+      guardAtStartById: state.lastFlip.guardAtStartById,
     });
 
     for (const line of settlement.log) pushLog(line);
+    if (settlement?.golemRebirthByPlayerId?.size) {
+      for (const x of settlement.golemRebirthByPlayerId) state.doubleNextByPlayer[x] = true;
+    }
 
-    const hpTraceById = applyDeltas(state, settlement.hpDelta, settlement.powerDelta);
+    const applied = applyDeltas(
+      state,
+      settlement.hpDelta,
+      settlement.powerDelta,
+      beforeSnapshot,
+      state.lastFlip.guardAtStartById,
+      settlement?.blockActiveByPlayerId ?? null,
+      settlement?.blockInnerByPlayerId ?? null
+    );
+    for (const line of applied?.log ?? []) pushLog(line);
+    const hpTraceById = applied?.hpTraceById ?? new Map();
+    const planEvents = [...(settlement.planEvents ?? []), ...(applied?.planEvents ?? [])];
 
-    p1.resolvedPile.unshift(p1Card);
-    p2.resolvedPile.unshift(p2Card);
+    if (settlement?.removeBothCardsFromGame === true) {
+      pushLog(`移除游戏：P1 ${formatCardLabel(p1Card)} / P2 ${formatCardLabel(p2Card)}`);
+    } else {
+      p1.resolvedPile.unshift(p1Card);
+      p2.resolvedPile.unshift(p2Card);
+    }
     const afterSnapshot = snapshotFighters();
-    state.lastRound = { round: state.round, turn: state.turn, before: beforeSnapshot, after: afterSnapshot, hpTraceById };
+    const guardBlocked = new Set([...(settlement?.guardBlockedByPlayerId ?? []), ...(applied?.guardBlockedByPlayerId ?? [])]);
+    const flipTriggered = settlement?.flipTriggeredByCardId && typeof settlement.flipTriggeredByCardId[Symbol.iterator] === "function" ? new Set(settlement.flipTriggeredByCardId) : new Set();
+    state.lastRound = { round: state.round, turn: state.turn, before: beforeSnapshot, after: afterSnapshot, hpTraceById, planEvents, guardBlockedByPlayerId: guardBlocked, flipTriggeredByCardId: flipTriggered };
     for (const [id, a] of afterSnapshot.entries()) {
       const b = beforeSnapshot.get(id);
       if (!b) continue;
@@ -2969,7 +4878,55 @@ function createApp() {
       pushLog(`结算变化：${who} ${name}（${parts.join("，")}）`);
     }
 
+    if (plannedDoubleQueue.length) {
+      state.pendingDoubleQueue = plannedDoubleQueue;
+      render();
+      return;
+    }
+
+    const processElfRoundEnd = (playerId) => {
+      const player = state.players[playerId];
+      const elf = player?.fighters?.find?.((f) => f?.name === "精灵族");
+      if (!elf || !elf.elf) return;
+      if (elf.elf.gameKo === true) return;
+      const active = elf.elf.active;
+      const dead = Array.isArray(elf.elf.dead) ? elf.elf.dead : [false, false, false];
+      elf.elf.dead = dead;
+      if (active == null) {
+        state.pendingElfPickByPlayer[playerId] = dead.some((x) => x === false);
+        return;
+      }
+      if (dead[active] === true) return;
+      if (Number(elf.hp) > Number(elf.koLine)) return;
+      const alreadyPending = Number.isFinite(elf.elf.pendingKoIndex) && elf.elf.pendingKoIndex !== null;
+      if (alreadyPending) return;
+      elf.elf.pendingKoIndex = active;
+      elf.elf.soul = (Number(elf.elf.soul) || 0) + 1;
+      const hasAlive = dead.some((x, i) => i !== active && x === false);
+      if (hasAlive) {
+        state.pendingElfPickByPlayer[playerId] = true;
+        pushLog(`灵：${playerId.toUpperCase()} 灵${active + 1} 被KO（魂=${elf.elf.soul}），请选择下一位灵`);
+      } else {
+        dead[active] = true;
+        elf.elf.dead = dead;
+        elf.elf.pendingKoIndex = null;
+        elf.elf.active = null;
+        elf.elf.pendingPick = false;
+        elf.hp = 0;
+        elf.maxHp = 0;
+        elf.hpRules = [];
+        state.pendingElfPickByPlayer[playerId] = false;
+        pushLog(`灵：${playerId.toUpperCase()} 无存活灵，精灵族进入沉寂（不再受伤/回复）`);
+      }
+    };
+    if (state.pendingElfPickByPlayer) {
+      processElfRoundEnd("p1");
+      processElfRoundEnd("p2");
+    }
+
     function isKoNow(fx) {
+      if (fx?.koByFlame === true) return true;
+      if (fx?.name === "精灵族") return fx?.elf?.gameKo === true;
       if (Array.isArray(fx.koLines) && fx.koLines.length > 0) {
         return fx.koLines.includes(Number(fx.hp) || 0);
       }
@@ -2977,6 +4934,8 @@ function createApp() {
     }
     const p1KO = state.players.p1.fighters.some(isKoNow);
     const p2KO = state.players.p2.fighters.some(isKoNow);
+    const flameKoP1 = settlement?.flameKoByPlayerId?.has?.("p1") === true;
+    const flameKoP2 = settlement?.flameKoByPlayerId?.has?.("p2") === true;
     const winOnSelfKoP1 = settlement?.winOnSelfKoByPlayer?.get?.("p1") === true;
     const winOnSelfKoP2 = settlement?.winOnSelfKoByPlayer?.get?.("p2") === true;
     const p1ClaimWin = winOnSelfKoP1 && p1KO;
@@ -2994,6 +4953,9 @@ function createApp() {
         w = "p2";
         pushLog(`特殊胜负：P2 被KO且触发“被KO则胜利”，最终 P2 获胜`);
       }
+    } else if ((flameKoP1 && !flameKoP2) || (flameKoP2 && !flameKoP1)) {
+      w = flameKoP1 ? "p2" : "p1";
+      pushLog(`特殊胜负：焰=5 判KO，忽略对方本回合KO判定，最终 ${w.toUpperCase()} 获胜`);
     }
     if (w) {
       state.pendingGameOver = w;
@@ -3089,7 +5051,18 @@ function createApp() {
     newGame();
   }
 
-  els.btnNewGame.addEventListener("click", newGame);
+  els.btnNewGame.addEventListener("click", () => {
+    const running =
+      state?.phase &&
+      state.phase !== PHASE.LOADING &&
+      state.phase !== PHASE.SETUP &&
+      state.phase !== PHASE.GAME_OVER;
+    if (running) {
+      const ok = window.confirm("游戏正在进行，是否中断并重开？");
+      if (!ok) return;
+    }
+    newGame();
+  });
   els.btnToggleDecks.addEventListener("click", () => {
     state.showDecks = !state.showDecks;
     render();
